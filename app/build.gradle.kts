@@ -45,6 +45,8 @@ android {
             excludes += "META-INF/INDEX.LIST"
             excludes += "META-INF/DEPENDENCIES"
             excludes += "META-INF/io.netty.versions.properties"
+            excludes += "META-INF/versions/**"
+            excludes += "META-INF/OSGI-INF/**"
         }
     }
 }
