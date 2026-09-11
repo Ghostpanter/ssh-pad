@@ -17,17 +17,29 @@ import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.util.Properties
 import java.util.Vector
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import org.apache.commons.net.telnet.EchoOptionHandler
+import org.apache.commons.net.telnet.SuppressGAOptionHandler
+import org.apache.commons.net.telnet.TelnetClient
+import org.apache.commons.net.telnet.TerminalTypeOptionHandler
+import org.apache.commons.net.telnet.WindowSizeOptionHandler
 
 /**
- * Process-scoped SSH session (JSch). Lives in the Application / foreground
- * service so window resize never tears the TCP/SSH link.
+ * Process-scoped session. All socket I/O runs on [io] so Compose / WebView
+ * never hits NetworkOnMainThreadException. Terminal bytes are pushed to
+ * registered sinks (xterm.js), not a Compose TextField.
  */
 object SshSessionManager {
     private const val TAG = "SshSessionManager"
+
+    private val io = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "session-io").apply { isDaemon = true }
+    }
 
     private val _connected = MutableStateFlow(false)
     val connected: StateFlow<Boolean> = _connected.asStateFlow()
@@ -35,8 +47,8 @@ object SshSessionManager {
     private val _status = MutableStateFlow("未连接")
     val status: StateFlow<String> = _status.asStateFlow()
 
-    private val _output = MutableStateFlow("")
-    val output: StateFlow<String> = _output.asStateFlow()
+    private val _kind = MutableStateFlow(TransportKind.SSH)
+    val kind: StateFlow<TransportKind> = _kind.asStateFlow()
 
     private val _remotePath = MutableStateFlow(".")
     val remotePath: StateFlow<String> = _remotePath.asStateFlow()
@@ -53,22 +65,48 @@ object SshSessionManager {
     @Volatile private var jsch: JSch? = null
     @Volatile private var session: Session? = null
     @Volatile private var shell: ChannelShell? = null
-    @Volatile private var shellIn: OutputStream? = null
+    @Volatile private var telnet: TelnetClient? = null
+    @Volatile private var outStream: OutputStream? = null
     @Volatile private var currentProfile: HostProfile? = null
-    private val shellAlive = AtomicBoolean(false)
+    @Volatile private var cols: Int = 120
+    @Volatile private var rows: Int = 40
+    private val alive = AtomicBoolean(false)
+
+    private val sinks = CopyOnWriteArrayList<(ByteArray) -> Unit>()
+    private val backlog = ArrayDeque<ByteArray>()
+    private const val BACKLOG_MAX = 256
+
+    fun attachSink(sink: (ByteArray) -> Unit) {
+        if (!sinks.contains(sink)) sinks.add(sink)
+        synchronized(backlog) {
+            backlog.forEach { sink(it) }
+            backlog.clear()
+        }
+    }
+
+    fun detachSink(sink: (ByteArray) -> Unit) {
+        sinks.remove(sink)
+    }
 
     @Synchronized
     fun connect(profile: HostProfile) {
         CryptoBootstrap.install()
-        if (_connected.value && currentProfile == profile && session?.isConnected == true) {
-            _status.value = "已连接 ${profile.username}@${profile.host}"
+        if (_connected.value && currentProfile == profile && isLive()) {
+            _status.value = statusLine(profile)
             return
         }
-        disconnectInternal(keepOutput = true)
+        disconnectInternal()
         currentProfile = profile
+        _kind.value = profile.kind
         _status.value = "正在连接 ${profile.host}:${profile.port}…"
-        append(">>> 连接 ${profile.username}@${profile.host}:${profile.port}\n")
+        emitLocal("\r\n\u001b[36mconnecting ${profile.host}:${profile.port} (${profile.kind})…\u001b[0m\r\n")
+        when (profile.kind) {
+            TransportKind.SSH -> connectSsh(profile)
+            TransportKind.TELNET -> connectTelnet(profile)
+        }
+    }
 
+    private fun connectSsh(profile: HostProfile) {
         val client = JSch()
         jsch = client
         val sess = client.getSession(profile.username, profile.host, profile.port)
@@ -104,60 +142,96 @@ object SshSessionManager {
         sess.connect(20_000)
         session = sess
 
-        openShell(sess)
+        val ch = sess.openChannel("shell") as ChannelShell
+        ch.setPtyType("xterm-256color", cols, rows, cols * 8, rows * 16)
+        ch.connect(15_000)
+        shell = ch
+        outStream = ch.outputStream
+        alive.set(true)
         _connected.value = true
-        _status.value = "已连接 ${profile.username}@${profile.host}:${profile.port}"
-        append(">>> 已连接。窗口切换不会断开（会话在前台服务中）。\n")
+        _status.value = statusLine(profile)
+        emitLocal("\u001b[32mconnected. type in the terminal.\u001b[0m\r\n")
+        Thread({ pump(ch.inputStream) }, "ssh-stdout").apply { isDaemon = true }.start()
+        Thread({ pump(ch.extInputStream) }, "ssh-stderr").apply { isDaemon = true }.start()
         try {
             listRemote(".")
         } catch (e: Exception) {
             Log.w(TAG, "sftp list after connect", e)
-            append("SFTP 列表失败: ${describeError(e)}\n")
         }
     }
 
-    private fun openShell(sess: Session) {
-        val ch = sess.openChannel("shell") as ChannelShell
-        ch.setPtyType("xterm-256color", 120, 40, 0, 0)
-        ch.connect(15_000)
-        shell = ch
-        shellIn = ch.outputStream
-        shellAlive.set(true)
-        Thread({ pump(ch.inputStream) }, "ssh-stdout").apply { isDaemon = true }.start()
-        Thread({ pump(ch.extInputStream) }, "ssh-stderr").apply { isDaemon = true }.start()
-        Thread({
-            while (shellAlive.get() && ch.isConnected) {
-                try {
-                    Thread.sleep(1000)
-                } catch (_: InterruptedException) {
-                    break
-                }
-            }
-            shellAlive.set(false)
-        }, "ssh-shell-wait").apply { isDaemon = true }.start()
+    private fun connectTelnet(profile: HostProfile) {
+        val client = TelnetClient()
+        client.connectTimeout = 20_000
+        client.defaultTimeout = 0
+        client.setReaderThread(true)
+        try {
+            client.addOptionHandler(EchoOptionHandler(false, false, true, false))
+            client.addOptionHandler(SuppressGAOptionHandler(true, true, true, true))
+            client.addOptionHandler(TerminalTypeOptionHandler("xterm-256color", false, false, true, false))
+            client.addOptionHandler(WindowSizeOptionHandler(cols, rows, true, true, true, true))
+        } catch (e: Exception) {
+            Log.w(TAG, "telnet options", e)
+        }
+        client.connect(profile.host, profile.port)
+        telnet = client
+        outStream = client.outputStream
+        alive.set(true)
+        _connected.value = true
+        _status.value = statusLine(profile)
+        emitLocal("\u001b[32mtelnet connected. login inside the terminal.\u001b[0m\r\n")
+        Thread({ pump(client.inputStream) }, "telnet-stdout").apply { isDaemon = true }.start()
     }
 
     private fun pump(stream: InputStream) {
         val buf = ByteArray(4096)
         try {
-            while (shellAlive.get()) {
+            while (alive.get()) {
                 val n = stream.read(buf)
                 if (n < 0) break
-                if (n > 0) append(String(buf, 0, n, StandardCharsets.UTF_8))
+                if (n > 0) emit(buf.copyOf(n))
             }
         } catch (e: Exception) {
             Log.w(TAG, "pump ended", e)
         }
+        if (alive.get()) {
+            fail("连接已断开")
+        }
     }
 
+    fun write(data: ByteArray) {
+        if (data.isEmpty()) return
+        io.execute {
+            try {
+                val out = outStream ?: return@execute
+                out.write(data)
+                out.flush()
+            } catch (e: Exception) {
+                Log.w(TAG, "write", e)
+                fail("发送失败: ${describeError(e)}")
+            }
+        }
+    }
+
+    fun writeUtf8(text: String) {
+        write(text.toByteArray(StandardCharsets.UTF_8))
+    }
+
+    /** Extra keys / leftover API. Never runs on the UI thread. */
     fun sendCommand(line: String) {
-        val out = shellIn ?: return
-        try {
-            out.write((line + "\n").toByteArray(StandardCharsets.UTF_8))
-            out.flush()
-            append("$ $line\n")
-        } catch (e: Exception) {
-            append("发送失败: ${e.message}\n")
+        writeUtf8(line + "\r")
+    }
+
+    fun resize(newCols: Int, newRows: Int) {
+        if (newCols < 2 || newRows < 1) return
+        cols = newCols
+        rows = newRows
+        io.execute {
+            try {
+                shell?.setPtySize(newCols, newRows, newCols * 8, newRows * 16)
+            } catch (e: Exception) {
+                Log.w(TAG, "pty resize", e)
+            }
         }
     }
 
@@ -189,7 +263,6 @@ object SshSessionManager {
                 Files.copy(input, dest, StandardCopyOption.REPLACE_EXISTING)
             }
         }
-        append("<<< 已下载 $remote -> ${dest.fileName}\n")
     }
 
     fun upload(local: Path, remoteName: String) {
@@ -199,43 +272,48 @@ object SshSessionManager {
                 sftp.put(input, remote)
             }
         }
-        append(">>> 已上传 ${local.fileName} -> $remote\n")
         listRemote(_remotePath.value)
     }
 
     private fun withSftp(block: (ChannelSftp) -> Unit) {
-        val sess = session ?: throw IllegalStateException("未连接")
+        val sess = session ?: throw IllegalStateException("当前不是 SSH 会话")
         if (!sess.isConnected) throw IllegalStateException("会话已断开")
         val ch = sess.openChannel("sftp") as ChannelSftp
         ch.connect(15_000)
         try {
             block(ch)
         } finally {
-            try {
-                ch.disconnect()
-            } catch (_: Exception) {
-            }
+            try { ch.disconnect() } catch (_: Exception) {}
         }
     }
 
     fun disconnect() {
-        disconnectInternal(keepOutput = false)
+        disconnectInternal()
         _status.value = "已断开"
-        append(">>> 已断开\n")
+        emitLocal("\r\n\u001b[33mdisconnected\u001b[0m\r\n")
     }
 
-    private fun disconnectInternal(keepOutput: Boolean) {
-        shellAlive.set(false)
-        try { shellIn?.close() } catch (_: Exception) {}
-        shellIn = null
+    private fun disconnectInternal() {
+        alive.set(false)
+        try { outStream?.close() } catch (_: Exception) {}
+        outStream = null
         try { shell?.disconnect() } catch (_: Exception) {}
         shell = null
         try { session?.disconnect() } catch (_: Exception) {}
         session = null
         jsch = null
+        try { telnet?.disconnect() } catch (_: Exception) {}
+        telnet = null
         _connected.value = false
-        if (!keepOutput) _output.value = ""
         _files.value = emptyList()
+    }
+
+    private fun isLive(): Boolean =
+        session?.isConnected == true || telnet?.isConnected == true
+
+    private fun statusLine(profile: HostProfile): String = when (profile.kind) {
+        TransportKind.SSH -> "SSH ${profile.username}@${profile.host}:${profile.port}"
+        TransportKind.TELNET -> "TELNET ${profile.host}:${profile.port}"
     }
 
     private fun join(dir: String, name: String): String {
@@ -243,24 +321,34 @@ object SshSessionManager {
         return if (dir.endsWith("/")) dir + name else "$dir/$name"
     }
 
-    private val lock = Any()
     fun fail(message: String) {
+        if (alive.get()) disconnectInternal()
         _connected.value = false
         _status.value = message
-        append("$message\n")
-    }
-
-    fun append(text: String) {
-        synchronized(lock) {
-            val next = _output.value + text
-            _output.value = if (next.length > 80_000) next.takeLast(60_000) else next
-        }
+        emitLocal("\r\n\u001b[31m$message\u001b[0m\r\n")
     }
 
     fun describeError(t: Throwable): String =
         generateSequence(t) { it.cause }
             .map { "${it.javaClass.simpleName}: ${it.message}" }
             .joinToString(" ← ")
+
+    private fun emitLocal(text: String) {
+        emit(text.toByteArray(StandardCharsets.UTF_8))
+    }
+
+    private fun emit(chunk: ByteArray) {
+        if (sinks.isEmpty()) {
+            synchronized(backlog) {
+                backlog.addLast(chunk)
+                while (backlog.size > BACKLOG_MAX) backlog.removeFirst()
+            }
+        } else {
+            sinks.forEach { sink ->
+                try { sink(chunk) } catch (e: Exception) { Log.w(TAG, "sink", e) }
+            }
+        }
+    }
 
     private fun passwordUserInfo(password: String): UserInfo =
         object : UserInfo, UIKeyboardInteractive {

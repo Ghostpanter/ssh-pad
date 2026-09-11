@@ -18,6 +18,7 @@ import com.sshtab.pad.MainActivity
 import com.sshtab.pad.R
 import com.sshtab.pad.ssh.HostProfile
 import com.sshtab.pad.ssh.SshSessionManager
+import com.sshtab.pad.ssh.TransportKind
 import kotlin.concurrent.thread
 
 class SshSessionService : Service() {
@@ -36,17 +37,24 @@ class SshSessionService : Service() {
                 ACTION_CONNECT -> {
                     acquireWakeLock()
                     val host = intent.getStringExtra(EXTRA_HOST)
-                    val user = intent.getStringExtra(EXTRA_USER)
-                    if (host.isNullOrBlank() || user.isNullOrBlank()) {
+                    val kindName = intent.getStringExtra(EXTRA_KIND) ?: TransportKind.SSH.name
+                    val kind = runCatching { TransportKind.valueOf(kindName) }.getOrDefault(TransportKind.SSH)
+                    val user = intent.getStringExtra(EXTRA_USER) ?: ""
+                    if (host.isNullOrBlank()) {
+                        SshSessionManager.fail("主机为空")
+                        return START_NOT_STICKY
+                    }
+                    if (kind == TransportKind.SSH && user.isBlank()) {
                         SshSessionManager.fail("主机或用户名为空")
                         return START_NOT_STICKY
                     }
                     val profile = HostProfile(
-                        name = intent.getStringExtra(EXTRA_NAME) ?: user,
+                        name = intent.getStringExtra(EXTRA_NAME) ?: user.ifBlank { host },
                         host = host,
-                        port = intent.getIntExtra(EXTRA_PORT, 22),
+                        port = intent.getIntExtra(EXTRA_PORT, if (kind == TransportKind.TELNET) 23 else 22),
                         username = user,
                         password = intent.getStringExtra(EXTRA_PASS) ?: "",
+                        kind = kind,
                     )
                     thread(name = "ssh-connect", isDaemon = true) {
                         try {
@@ -143,6 +151,7 @@ class SshSessionService : Service() {
         const val EXTRA_PORT = "port"
         const val EXTRA_USER = "user"
         const val EXTRA_PASS = "pass"
+        const val EXTRA_KIND = "kind"
         private const val CHANNEL_ID = "ssh_session"
         private const val NOTIF_ID = 17
 
@@ -154,6 +163,7 @@ class SshSessionService : Service() {
                 putExtra(EXTRA_PORT, profile.port)
                 putExtra(EXTRA_USER, profile.username)
                 putExtra(EXTRA_PASS, profile.password)
+                putExtra(EXTRA_KIND, profile.kind.name)
             }
             try {
                 ContextCompat.startForegroundService(context, intent)

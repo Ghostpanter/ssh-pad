@@ -12,8 +12,8 @@ android {
         applicationId = "com.sshtab.pad"
         minSdk = 26
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.1.0"
+        versionCode = 4
+        versionName = "1.2.0"
     }
 
     buildTypes {
@@ -66,6 +66,7 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
     implementation("com.github.mwiede:jsch:0.2.26")
+    implementation("commons-net:commons-net:3.11.1")
     implementation("org.bouncycastle:bcprov-jdk18on:1.80")
     implementation("org.bouncycastle:bcpkix-jdk18on:1.80")
     implementation("net.i2p.crypto:eddsa:0.3.0")

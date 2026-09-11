@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+  <link rel="stylesheet" href="xterm.css"/>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; width: 100%; background: #0b1220; overflow: hidden; }
+    #term { position: absolute; inset: 0; }
+    .xterm { height: 100%; }
+    .xterm-viewport { overflow-y: auto !important; }
+  </style>
+</head>
+<body>
+  <div id="term"></div>
+  <script src="xterm.js"></script>
+  <script src="xterm-addon-fit.js"></script>
+  <script>
+    const term = new Terminal({
+      cursorBlink: true,
+      cursorStyle: 'bar',
+      fontFamily: 'Menlo, Consolas, "Droid Sans Mono", monospace',
+      fontSize: 15,
+      lineHeight: 1.15,
+      scrollback: 8000,
+      theme: {
+        background: '#0b1220',
+        foreground: '#d7e0ea',
+        cursor: '#3ddcff',
+        cursorAccent: '#0b1220',
+        selectionBackground: '#3d5aa888',
+        black: '#0b1220',
+        red: '#ff6b6b',
+        green: '#7cdbb6',
+        yellow: '#e6c07b',
+        blue: '#61afef',
+        magenta: '#c678dd',
+        cyan: '#3ddcff',
+        white: '#d7e0ea',
+        brightBlack: '#5c6773',
+        brightRed: '#ff8787',
+        brightGreen: '#98e6c8',
+        brightYellow: '#f0d48a',
+        brightBlue: '#8fc7f5',
+        brightMagenta: '#d7a1e8',
+        brightCyan: '#7aebff',
+        brightWhite: '#ffffff'
+      }
+    });
+    const fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(document.getElementById('term'));
+    function doFit() {
+      try { fit.fit(); } catch (e) {}
+      try { if (window.SshPad) SshPad.onResize(term.cols, term.rows); } catch (e) {}
+    }
+    setTimeout(doFit, 30);
+    window.addEventListener('resize', doFit);
+    term.onData(function (d) {
+      try { if (window.SshPad) SshPad.onData(d); } catch (e) {}
+    });
+    window.__writeB64 = function (b64) {
+      const bin = atob(b64);
+      const arr = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) arr[i] = bin.charCodeAt(i);
+      term.write(arr);
+    };
+    window.__fit = doFit;
+    window.__focus = function () { term.focus(); };
+    window.__reset = function () { term.reset(); doFit(); };
+    document.addEventListener('click', function () { term.focus(); });
+    document.addEventListener('touchend', function () { term.focus(); });
+  </script>
+</body>
+</html>
