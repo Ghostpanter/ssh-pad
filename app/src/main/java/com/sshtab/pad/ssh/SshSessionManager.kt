@@ -7,7 +7,6 @@ import java.nio.charset.StandardCharsets
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
-import java.security.KeyPair
 import java.time.Duration
 import java.util.EnumSet
 import java.util.concurrent.atomic.AtomicBoolean
@@ -21,6 +20,7 @@ import org.apache.sshd.common.keyprovider.KeyIdentityProvider
 import org.apache.sshd.common.session.SessionHeartbeatController
 import org.apache.sshd.core.CoreModuleProperties
 import org.apache.sshd.sftp.client.SftpClientFactory
+import org.apache.sshd.client.keyverifier.AcceptAllServerKeyVerifier
 
 /**
  * Process-scoped SSH session. Lives in the Application / foreground service
@@ -70,15 +70,11 @@ object SshSessionManager {
         val c = SshClient.setUpDefaultClient()
         CoreModuleProperties.IDLE_TIMEOUT.set(c, Duration.ofDays(7))
         CoreModuleProperties.NIO2_READ_TIMEOUT.set(c, Duration.ofDays(7))
-        try {
-            c.sessionHeartbeat = SessionHeartbeatController.HeartbeatType.IGNORE
-        } catch (_: Throwable) {
-        }
+        c.setSessionHeartbeat(SessionHeartbeatController.HeartbeatType.IGNORE, Duration.ofSeconds(15))
         CoreModuleProperties.HEARTBEAT_INTERVAL.set(c, Duration.ofSeconds(15))
         CoreModuleProperties.HEARTBEAT_REPLY_WAIT.set(c, Duration.ofSeconds(30))
-
-        c.serverKeyVerifier = { _, _, _ -> true }
-        c.keyIdentityProvider = KeyIdentityProvider { emptyList<KeyPair>() }
+        c.serverKeyVerifier = AcceptAllServerKeyVerifier.INSTANCE
+        c.keyIdentityProvider = KeyIdentityProvider.EMPTY_KEYS_PROVIDER
         c.start()
         client = c
 
