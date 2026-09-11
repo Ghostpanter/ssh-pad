@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">SSH Pad</string>
+    <string name="session_channel">SSH 会话</string>
+    <string name="session_notification">SSH 连接保持中</string>
+</resources>
