@@ -1,5 +1,5 @@
+-keep class com.jcraft.jsch.** { *; }
 -keep class org.bouncycastle.** { *; }
--keep class org.apache.sshd.** { *; }
--keep class net.i2p.crypto.** { *; }
--dontwarn org.slf4j.**
--dontwarn org.apache.sshd.**
+-keep class net.i2p.crypto.eddsa.** { *; }
+-dontwarn org.bouncycastle.**
+-dontwarn net.i2p.crypto.eddsa.**

@@ -53,9 +53,7 @@ class SshSessionService : Service() {
                             SshSessionManager.connect(profile)
                         } catch (t: Throwable) {
                             Log.e(TAG, "connect failed", t)
-                            SshSessionManager.fail(
-                                "连接失败: ${t.javaClass.simpleName}: ${t.message}"
-                            )
+                            SshSessionManager.fail("连接失败: ${SshSessionManager.describeError(t)}")
                         }
                     }
                 }
@@ -170,7 +168,7 @@ class SshSessionService : Service() {
                             SshSessionManager.connect(profile)
                         } catch (t3: Throwable) {
                             SshSessionManager.fail(
-                                "连接失败: ${t3.javaClass.simpleName}: ${t3.message}"
+                                "连接失败: ${SshSessionManager.describeError(t3)}"
                             )
                         }
                     }

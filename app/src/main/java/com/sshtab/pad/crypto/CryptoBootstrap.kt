@@ -22,7 +22,7 @@ object CryptoBootstrap {
             if (Security.getProvider(EdDSASecurityProvider.PROVIDER_NAME) == null) {
                 Security.insertProviderAt(EdDSASecurityProvider(), 2)
             }
-            System.setProperty("org.apache.sshd.registerBouncyCastle", "false")
+            System.setProperty("java.security.egd", "file:/dev/urandom")
             ready = true
         }
     }
