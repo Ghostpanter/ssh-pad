@@ -1,5 +1,5 @@
 <resources>
     <string name="app_name">SSH Pad</string>
-    <string name="session_channel">远程会话</string>
-    <string name="session_notification">SSH / Telnet 连接保持中</string>
+    <string name="session_channel">远程会话保活</string>
+    <string name="session_notification">会话在后台保持中，请勿关闭此通知</string>
 </resources>

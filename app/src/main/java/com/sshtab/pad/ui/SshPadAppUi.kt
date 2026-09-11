@@ -229,7 +229,7 @@ private fun ConnectAndTerminal(modifier: Modifier, connected: Boolean) {
             }
             Spacer(Modifier.height(12.dp))
             Text(
-                "连接后像 ServerBox 一样直接在终端里输入，系统键盘 + 下方快捷键。切窗口不断开。",
+                "连接后像 ServerBox 一样直接在终端里输入。切到其他应用也会保活：请允许通知，并在弹出的电池优化对话框里选「允许」。",
                 style = MaterialTheme.typography.bodySmall,
             )
         } else {

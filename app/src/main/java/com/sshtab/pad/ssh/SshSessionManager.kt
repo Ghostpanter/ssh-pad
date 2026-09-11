@@ -38,7 +38,7 @@ object SshSessionManager {
     private const val TAG = "SshSessionManager"
 
     private val io = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "session-io").apply { isDaemon = true }
+        Thread(r, "session-io").apply { isDaemon = false }
     }
 
     private val _connected = MutableStateFlow(false)
@@ -135,12 +135,14 @@ object SshSessionManager {
         cfg["HashKnownHosts"] = "no"
         cfg["PreferredAuthentications"] = "password,keyboard-interactive"
         cfg["MaxAuthTries"] = "3"
+        cfg["TCPKeepAlive"] = "yes"
         sess.setConfig(cfg)
-        sess.setServerAliveInterval(15_000)
-        sess.setServerAliveCountMax(1_000)
-        sess.setDaemonThread(true)
+        sess.setServerAliveInterval(8_000)
+        sess.setServerAliveCountMax(10_000)
+        sess.setDaemonThread(false)
         sess.connect(20_000)
         session = sess
+        hardenSocket(sess)
 
         val ch = sess.openChannel("shell") as ChannelShell
         ch.setPtyType("xterm-256color", cols, rows, cols * 8, rows * 16)
@@ -151,8 +153,8 @@ object SshSessionManager {
         _connected.value = true
         _status.value = statusLine(profile)
         emitLocal("\u001b[32mconnected. type in the terminal.\u001b[0m\r\n")
-        Thread({ pump(ch.inputStream) }, "ssh-stdout").apply { isDaemon = true }.start()
-        Thread({ pump(ch.extInputStream) }, "ssh-stderr").apply { isDaemon = true }.start()
+        Thread({ pump(ch.inputStream) }, "ssh-stdout").apply { isDaemon = false }.start()
+        Thread({ pump(ch.extInputStream) }, "ssh-stderr").apply { isDaemon = false }.start()
         try {
             listRemote(".")
         } catch (e: Exception) {
@@ -174,13 +176,20 @@ object SshSessionManager {
             Log.w(TAG, "telnet options", e)
         }
         client.connect(profile.host, profile.port)
+        try {
+            client.setKeepAlive(true)
+            client.setTcpNoDelay(true)
+            client.setSoTimeout(0)
+        } catch (e: Exception) {
+            Log.w(TAG, "telnet socket opts", e)
+        }
         telnet = client
         outStream = client.outputStream
         alive.set(true)
         _connected.value = true
         _status.value = statusLine(profile)
         emitLocal("\u001b[32mtelnet connected. login inside the terminal.\u001b[0m\r\n")
-        Thread({ pump(client.inputStream) }, "telnet-stdout").apply { isDaemon = true }.start()
+        Thread({ pump(client.inputStream) }, "telnet-stdout").apply { isDaemon = false }.start()
     }
 
     private fun pump(stream: InputStream) {
@@ -308,8 +317,49 @@ object SshSessionManager {
         _files.value = emptyList()
     }
 
-    private fun isLive(): Boolean =
+    fun keepAliveOnce(): Boolean {
+        val sess = session
+        if (sess != null) {
+            if (!sess.isConnected) return false
+            sess.sendKeepAliveMsg()
+            return true
+        }
+        val tn = telnet
+        if (tn != null) {
+            if (!tn.isConnected) return false
+            val out = tn.outputStream
+            io.execute {
+                try {
+                    out.write(byteArrayOf(0xFF.toByte(), 0xF1.toByte()))
+                    out.flush()
+                } catch (e: Exception) {
+                    Log.w(TAG, "telnet nop", e)
+                }
+            }
+            return true
+        }
+        return false
+    }
+
+    fun isLive(): Boolean =
         session?.isConnected == true || telnet?.isConnected == true
+
+    private fun hardenSocket(sess: Session) {
+        try {
+            val field = sess.javaClass.declaredFields.firstOrNull {
+                it.type == java.net.Socket::class.java || it.name.equals("socket", true)
+            } ?: sess.javaClass.superclass?.declaredFields?.firstOrNull {
+                it.type == java.net.Socket::class.java
+            }
+            field?.isAccessible = true
+            val sock = field?.get(sess) as? java.net.Socket ?: return
+            sock.keepAlive = true
+            sock.tcpNoDelay = true
+            sock.soTimeout = 0
+        } catch (e: Exception) {
+            Log.w(TAG, "hardenSocket", e)
+        }
+    }
 
     private fun statusLine(profile: HostProfile): String = when (profile.kind) {
         TransportKind.SSH -> "SSH ${profile.username}@${profile.host}:${profile.port}"
