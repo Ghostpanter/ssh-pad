@@ -5,13 +5,14 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <application
         android:name=".SshPadApp"
         android:allowBackup="true"
-        android:icon="@android:drawable/ic_menu_compass"
+        android:icon="@drawable/ic_stat_ssh"
         android:label="@string/app_name"
         android:supportsRtl="true"
         android:theme="@style/Theme.SshPad"
@@ -31,7 +32,11 @@
         <service
             android:name=".service.SshSessionService"
             android:exported="false"
-            android:foregroundServiceType="dataSync"
-            android:stopWithTask="false" />
+            android:foregroundServiceType="dataSync|specialUse"
+            android:stopWithTask="false">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Keep SSH session alive across window resize" />
+        </service>
     </application>
 </manifest>

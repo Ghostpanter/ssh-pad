@@ -2,7 +2,6 @@ package com.sshtab.pad.ui
 
 import android.content.Intent
 import android.net.Uri
-import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.horizontalScroll
@@ -60,6 +59,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import com.sshtab.pad.service.SshSessionService
+import com.sshtab.pad.ssh.HostProfile
 import com.sshtab.pad.ssh.SshSessionManager
 import java.io.File
 import kotlinx.coroutines.Dispatchers
@@ -163,16 +163,19 @@ private fun ConnectAndTerminal(modifier: Modifier) {
                 }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = {
-                        val intent = Intent(ctx, SshSessionService::class.java).apply {
-                            action = SshSessionService.ACTION_CONNECT
-                            putExtra(SshSessionService.EXTRA_NAME, user)
-                            putExtra(SshSessionService.EXTRA_HOST, host.trim())
-                            putExtra(SshSessionService.EXTRA_PORT, port.toIntOrNull() ?: 22)
-                            putExtra(SshSessionService.EXTRA_USER, user.trim())
-                            putExtra(SshSessionService.EXTRA_PASS, pass)
+                        val profile = HostProfile(
+                            name = user.trim(),
+                            host = host.trim(),
+                            port = port.toIntOrNull() ?: 22,
+                            username = user.trim(),
+                            password = pass,
+                        )
+                        if (profile.host.isBlank() || profile.username.isBlank()) {
+                            SshSessionManager.fail("请填写主机和用户名")
+                        } else {
+                            SshSessionManager.append(">>> 正在连接 ${profile.username}@${profile.host}…\n")
+                            SshSessionService.startConnect(ctx, profile)
                         }
-                        if (Build.VERSION.SDK_INT >= 26) ctx.startForegroundService(intent)
-                        else ctx.startService(intent)
                     }) { Text(if (connected) "保持 / 重连" else "连接") }
                     if (connected) {
                         FilledTonalButton(onClick = {

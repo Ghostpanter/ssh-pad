@@ -1,6 +1,7 @@
 package com.sshtab.pad.ssh
 
 import android.util.Log
+import com.sshtab.pad.crypto.CryptoBootstrap
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
@@ -15,12 +16,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import org.apache.sshd.client.SshClient
 import org.apache.sshd.client.channel.ClientChannelEvent
+import org.apache.sshd.client.keyverifier.AcceptAllServerKeyVerifier
 import org.apache.sshd.client.session.ClientSession
 import org.apache.sshd.common.keyprovider.KeyIdentityProvider
 import org.apache.sshd.common.session.SessionHeartbeatController
 import org.apache.sshd.core.CoreModuleProperties
 import org.apache.sshd.sftp.client.SftpClientFactory
-import org.apache.sshd.client.keyverifier.AcceptAllServerKeyVerifier
 
 /**
  * Process-scoped SSH session. Lives in the Application / foreground service
@@ -58,6 +59,7 @@ object SshSessionManager {
 
     @Synchronized
     fun connect(profile: HostProfile) {
+        CryptoBootstrap.install()
         if (_connected.value && currentProfile == profile) {
             _status.value = "已连接 ${profile.username}@${profile.host}"
             return
@@ -68,13 +70,31 @@ object SshSessionManager {
         append(">>> 连接 ${profile.username}@${profile.host}:${profile.port}\n")
 
         val c = SshClient.setUpDefaultClient()
-        CoreModuleProperties.IDLE_TIMEOUT.set(c, Duration.ofDays(7))
-        CoreModuleProperties.NIO2_READ_TIMEOUT.set(c, Duration.ofDays(7))
-        c.setSessionHeartbeat(SessionHeartbeatController.HeartbeatType.IGNORE, Duration.ofSeconds(15))
+        CoreModuleProperties.IDLE_TIMEOUT.set(c, Duration.ofHours(12))
+        CoreModuleProperties.NIO2_READ_TIMEOUT.set(c, Duration.ofHours(12))
+        try {
+            c.setSessionHeartbeat(
+                SessionHeartbeatController.HeartbeatType.IGNORE,
+                Duration.ofSeconds(15),
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "heartbeat", t)
+        }
         CoreModuleProperties.HEARTBEAT_INTERVAL.set(c, Duration.ofSeconds(15))
         CoreModuleProperties.HEARTBEAT_REPLY_WAIT.set(c, Duration.ofSeconds(30))
         c.serverKeyVerifier = AcceptAllServerKeyVerifier.INSTANCE
         c.keyIdentityProvider = KeyIdentityProvider.EMPTY_KEYS_PROVIDER
+        try {
+            val keep = c.keyExchangeFactories.filter { factory ->
+                val n = factory.name.lowercase()
+                !n.contains("sntrup") && !n.contains("mlkem")
+            }
+            if (keep.isNotEmpty()) {
+                c.keyExchangeFactories = keep
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "kex filter", t)
+        }
         c.start()
         client = c
 

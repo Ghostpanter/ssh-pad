@@ -5,12 +5,15 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
+import android.util.Log
 import androidx.core.app.NotificationCompat
+import androidx.core.content.ContextCompat
 import com.sshtab.pad.MainActivity
 import com.sshtab.pad.R
 import com.sshtab.pad.ssh.HostProfile
@@ -23,38 +26,60 @@ class SshSessionService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
-            ACTION_CONNECT -> {
-                startInForeground()
-                acquireWakeLock()
-                val profile = HostProfile(
-                    name = intent.getStringExtra(EXTRA_NAME) ?: "",
-                    host = intent.getStringExtra(EXTRA_HOST) ?: return START_NOT_STICKY,
-                    port = intent.getIntExtra(EXTRA_PORT, 22),
-                    username = intent.getStringExtra(EXTRA_USER) ?: return START_NOT_STICKY,
-                    password = intent.getStringExtra(EXTRA_PASS) ?: "",
-                )
-                thread(name = "ssh-connect") {
-                    try {
-                        SshSessionManager.connect(profile)
-                    } catch (e: Exception) {
-                        val msg = e.message ?: e.javaClass.simpleName
-                        android.util.Log.e("SshSessionService", "connect failed", e)
-                        SshSessionManager.fail("连接失败: $msg")
+        try {
+            startInForegroundSafely()
+        } catch (t: Throwable) {
+            Log.e(TAG, "startForeground failed", t)
+        }
+        try {
+            when (intent?.action) {
+                ACTION_CONNECT -> {
+                    acquireWakeLock()
+                    val host = intent.getStringExtra(EXTRA_HOST)
+                    val user = intent.getStringExtra(EXTRA_USER)
+                    if (host.isNullOrBlank() || user.isNullOrBlank()) {
+                        SshSessionManager.fail("主机或用户名为空")
+                        return START_NOT_STICKY
+                    }
+                    val profile = HostProfile(
+                        name = intent.getStringExtra(EXTRA_NAME) ?: user,
+                        host = host,
+                        port = intent.getIntExtra(EXTRA_PORT, 22),
+                        username = user,
+                        password = intent.getStringExtra(EXTRA_PASS) ?: "",
+                    )
+                    thread(name = "ssh-connect", isDaemon = true) {
+                        try {
+                            SshSessionManager.connect(profile)
+                        } catch (t: Throwable) {
+                            Log.e(TAG, "connect failed", t)
+                            SshSessionManager.fail(
+                                "连接失败: ${t.javaClass.simpleName}: ${t.message}"
+                            )
+                        }
                     }
                 }
+                ACTION_DISCONNECT -> {
+                    SshSessionManager.disconnect()
+                    try {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                    } catch (_: Throwable) {
+                    }
+                    stopSelf()
+                }
             }
-            ACTION_DISCONNECT -> {
-                SshSessionManager.disconnect()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-            }
+        } catch (t: Throwable) {
+            Log.e(TAG, "onStartCommand", t)
+            SshSessionManager.fail("服务异常: ${t.message}")
         }
         return START_STICKY
     }
 
     override fun onDestroy() {
-        wakeLock?.let { if (it.isHeld) it.release() }
+        try {
+            wakeLock?.let { if (it.isHeld) it.release() }
+        } catch (_: Throwable) {
+        }
         super.onDestroy()
     }
 
@@ -67,7 +92,7 @@ class SshSessionService : Service() {
         }
     }
 
-    private fun startInForeground() {
+    private fun startInForegroundSafely() {
         val nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         if (Build.VERSION.SDK_INT >= 26) {
             nm.createNotificationChannel(
@@ -85,18 +110,34 @@ class SshSessionService : Service() {
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(getString(R.string.session_notification))
-            .setSmallIcon(android.R.drawable.stat_sys_upload)
+            .setSmallIcon(R.drawable.ic_stat_ssh)
             .setContentIntent(pi)
             .setOngoing(true)
+            .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .build()
+        val errors = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+            try {
+                startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+                return
+            } catch (t: Throwable) {
+                errors += t.javaClass.simpleName
+            }
+            try {
+                @Suppress("DEPRECATION")
+                startForeground(NOTIF_ID, notification)
+                return
+            } catch (t: Throwable) {
+                errors += t.javaClass.simpleName
+            }
         } else {
             startForeground(NOTIF_ID, notification)
         }
+        Log.w(TAG, "foreground not started: $errors")
     }
 
     companion object {
+        private const val TAG = "SshSessionService"
         const val ACTION_CONNECT = "com.sshtab.pad.CONNECT"
         const val ACTION_DISCONNECT = "com.sshtab.pad.DISCONNECT"
         const val EXTRA_NAME = "name"
@@ -106,5 +147,35 @@ class SshSessionService : Service() {
         const val EXTRA_PASS = "pass"
         private const val CHANNEL_ID = "ssh_session"
         private const val NOTIF_ID = 17
+
+        fun startConnect(context: Context, profile: HostProfile) {
+            val intent = Intent(context, SshSessionService::class.java).apply {
+                action = ACTION_CONNECT
+                putExtra(EXTRA_NAME, profile.name)
+                putExtra(EXTRA_HOST, profile.host)
+                putExtra(EXTRA_PORT, profile.port)
+                putExtra(EXTRA_USER, profile.username)
+                putExtra(EXTRA_PASS, profile.password)
+            }
+            try {
+                ContextCompat.startForegroundService(context, intent)
+            } catch (t: Throwable) {
+                Log.w(TAG, "startForegroundService failed, fallback startService", t)
+                try {
+                    context.startService(intent)
+                } catch (t2: Throwable) {
+                    Log.e(TAG, "startService failed", t2)
+                    thread(name = "ssh-connect", isDaemon = true) {
+                        try {
+                            SshSessionManager.connect(profile)
+                        } catch (t3: Throwable) {
+                            SshSessionManager.fail(
+                                "连接失败: ${t3.javaClass.simpleName}: ${t3.message}"
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 }

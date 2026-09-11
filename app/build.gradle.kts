@@ -12,8 +12,8 @@ android {
         applicationId = "com.sshtab.pad"
         minSdk = 26
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.1"
     }
 
     buildTypes {
@@ -71,5 +71,5 @@ dependencies {
     implementation("org.bouncycastle:bcprov-jdk18on:1.80")
     implementation("org.bouncycastle:bcpkix-jdk18on:1.80")
     implementation("net.i2p.crypto:eddsa:0.3.0")
-    implementation("org.slf4j:slf4j-android:1.7.36")
+    implementation("org.slf4j:slf4j-jdk14:2.0.16")
 }
