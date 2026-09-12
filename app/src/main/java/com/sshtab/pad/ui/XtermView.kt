@@ -34,7 +34,13 @@ fun XtermView(modifier: Modifier = Modifier) {
     }
 
     DisposableEffect(Unit) {
+        val cancelReset = SessionClient.onTerminalReset {
+            XtermHolder.webView?.post {
+                XtermHolder.webView?.evaluateJavascript("window.__reset && window.__reset()", null)
+            }
+        }
         onDispose {
+            cancelReset()
             SessionClient.detachSink(sink)
             SessionLog.event("xterm disposed")
         }

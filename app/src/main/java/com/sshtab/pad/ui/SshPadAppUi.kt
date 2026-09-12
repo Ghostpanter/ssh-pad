@@ -77,6 +77,7 @@ import kotlinx.coroutines.withContext
 fun SshPadAppUi() {
     var tab by remember { mutableIntStateOf(0) }
     val connected by SessionClient.connected.collectAsState()
+    val held by SessionClient.held.collectAsState()
     val status by SessionClient.status.collectAsState()
     val kind by SessionClient.kind.collectAsState()
 
@@ -125,7 +126,7 @@ fun SshPadAppUi() {
                         )
                     }
                     when (tab) {
-                        0 -> ConnectAndTerminal(Modifier.weight(1f), connected)
+                        0 -> ConnectAndTerminal(Modifier.weight(1f), held)
                         1 -> FilePane(Modifier.weight(1f), connected && kind == TransportKind.SSH)
                         else -> LogPane(Modifier.weight(1f))
                     }
@@ -150,7 +151,7 @@ fun SshPadAppUi() {
                             ) { Text("日志") }
                         }
                         when (tab) {
-                            0 -> ConnectAndTerminal(Modifier.weight(1f), connected)
+                            0 -> ConnectAndTerminal(Modifier.weight(1f), held)
                             1 -> FilePane(Modifier.weight(1f), connected && kind == TransportKind.SSH)
                             else -> LogPane(Modifier.weight(1f))
                         }
@@ -162,7 +163,7 @@ fun SshPadAppUi() {
 }
 
 @Composable
-private fun ConnectAndTerminal(modifier: Modifier, connected: Boolean) {
+private fun ConnectAndTerminal(modifier: Modifier, held: Boolean) {
     val ctx = LocalContext.current
     val formPrefs = remember { ctx.getSharedPreferences("form", 0) }
     var kind by remember {
@@ -177,7 +178,7 @@ private fun ConnectAndTerminal(modifier: Modifier, connected: Boolean) {
     var pass by remember { mutableStateOf("") }
 
     Column(modifier.padding(12.dp)) {
-        if (!connected) {
+        if (!held) {
             Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

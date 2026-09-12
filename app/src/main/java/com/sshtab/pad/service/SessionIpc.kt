@@ -18,6 +18,7 @@ object SessionIpc {
     const val MSG_FILES = 102
     const val MSG_LOG = 103
     const val MSG_REPLY = 104
+    const val MSG_RESET = 105
 
     const val EXTRA_HOST = "host"
     const val EXTRA_PORT = "port"

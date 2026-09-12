@@ -85,6 +85,8 @@ class SshSessionService : Service() {
                     SessionLog.event("FGS ensure, connected=${SshSessionManager.connected.value} live=${SshSessionManager.isLive()}")
                     if (SshSessionManager.connected.value || SshSessionManager.isLive()) {
                         startKeepAliveLoop()
+                        player?.start()
+                        floatBubble?.show()
                     }
                 }
                 null -> {
@@ -297,6 +299,7 @@ class SshSessionService : Service() {
             }
             cm.requestNetwork(request, cb)
             networkCallback = cb
+            SessionLog.event("holdNetwork requestNetwork wifi ok")
             try {
                 val eth = NetworkRequest.Builder()
                     .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
@@ -307,6 +310,21 @@ class SshSessionService : Service() {
         } catch (t: Throwable) {
             Log.w(TAG, "holdNetwork", t)
             SessionLog.event("holdNetwork failed: ${t.message}")
+            try {
+                val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+                val cb = object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) {
+                        SessionLog.event("defaultNetwork available $network")
+                    }
+                }
+                if (Build.VERSION.SDK_INT >= 24) {
+                    cm.registerDefaultNetworkCallback(cb)
+                    networkCallback = cb
+                    SessionLog.event("holdNetwork fallback registerDefaultNetworkCallback")
+                }
+            } catch (t2: Throwable) {
+                SessionLog.event("holdNetwork fallback failed: ${t2.message}")
+            }
         }
     }
 
@@ -395,7 +413,7 @@ class SshSessionService : Service() {
                     NotificationChannel(
                         CHANNEL_ID,
                         getString(R.string.session_channel),
-                        NotificationManager.IMPORTANCE_DEFAULT,
+                        NotificationManager.IMPORTANCE_HIGH,
                     ).apply {
                         setShowBadge(false)
                         description = "保持 SSH / Telnet 会话在后台不断开"
@@ -417,7 +435,7 @@ class SshSessionService : Service() {
             .setOnlyAlertOnce(true)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
-            .setPriority(NotificationCompat.PRIORITY_DEFAULT)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
         try {
             player?.mediaSession?.sessionToken?.let { token ->
@@ -470,6 +488,8 @@ class SshSessionService : Service() {
         try {
             when (msg.what) {
                 SessionIpc.MSG_SUBSCRIBE -> {
+                    sendReset(replyTo)
+                    replayScrollback(replyTo)
                     broadcastStatus()
                     broadcastFiles()
                     broadcastLog(replyTo)
@@ -539,7 +559,7 @@ class SshSessionService : Service() {
                 SessionIpc.MSG_ENSURE -> {
                     startInForegroundSafely()
                     acquireLocks()
-                    if (SshSessionManager.connected.value) {
+                    if (SshSessionManager.connected.value || SshSessionManager.isLive()) {
                         player?.start()
                         floatBubble?.show()
                         startKeepAliveLoop()
@@ -549,6 +569,32 @@ class SshSessionService : Service() {
             }
         } catch (t: Throwable) {
             SessionLog.event("ipc ${msg.what}: ${t.javaClass.simpleName}: ${t.message}")
+        }
+    }
+
+    private fun sendReset(to: Messenger?) {
+        val targets = if (to != null) listOf(to) else listeners.toList()
+        for (m in targets) {
+            try {
+                m.send(Message.obtain(null, SessionIpc.MSG_RESET))
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun replayScrollback(to: Messenger?) {
+        val chunks = SshSessionManager.snapshotScrollback()
+        SessionLog.event("replay ${chunks.size} chunks to UI")
+        val targets = if (to != null) listOf(to) else listeners.toList()
+        for (chunk in chunks) {
+            for (m in targets) {
+                try {
+                    val msg = Message.obtain(null, SessionIpc.MSG_OUTPUT)
+                    msg.data = Bundle().apply { putByteArray(SessionIpc.EXTRA_BYTES, chunk) }
+                    m.send(msg)
+                } catch (_: Throwable) {
+                }
+            }
         }
     }
 
@@ -641,7 +687,7 @@ class SshSessionService : Service() {
         const val EXTRA_USER = "user"
         const val EXTRA_PASS = "pass"
         const val EXTRA_KIND = "kind"
-        private const val CHANNEL_ID = "ssh_session"
+        private const val CHANNEL_ID = "ssh_keep_media"
         private const val NOTIF_ID = 17
         private const val PREFS = "session"
         private const val KEY_RECONNECT = "reconnect"

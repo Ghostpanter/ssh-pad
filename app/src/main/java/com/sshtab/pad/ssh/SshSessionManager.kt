@@ -97,6 +97,8 @@ object SshSessionManager {
         sinks.remove(sink)
     }
 
+    fun snapshotScrollback(): List<ByteArray> = synchronized(scrollback) { scrollback.toList() }
+
     @Synchronized
     fun connect(profile: HostProfile) {
         CryptoBootstrap.install()

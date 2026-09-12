@@ -37,6 +37,9 @@ object SessionClient {
     private val _connected = MutableStateFlow(false)
     val connected: StateFlow<Boolean> = _connected.asStateFlow()
 
+    private val _held = MutableStateFlow(false)
+    val held: StateFlow<Boolean> = _held.asStateFlow()
+
     private val _status = MutableStateFlow("未连接")
     val status: StateFlow<String> = _status.asStateFlow()
 
@@ -56,6 +59,7 @@ object SessionClient {
         private set
 
     private val sinks = CopyOnWriteArrayList<(ByteArray) -> Unit>()
+    private val resets = CopyOnWriteArrayList<() -> Unit>()
     private val pending = ConcurrentHashMap<Int, CountDownLatch>()
     private val pendingError = ConcurrentHashMap<Int, String>()
     private val reqId = AtomicInteger(1)
@@ -80,6 +84,10 @@ object SessionClient {
                     val kindName = msg.data.getString(SessionIpc.EXTRA_KIND) ?: TransportKind.SSH.name
                     _status.value = text
                     _connected.value = on
+                    if (on) _held.value = true
+                    else if (text.contains("已断开") || text.contains("连接失败") || text.startsWith("请填写")) {
+                        _held.value = false
+                    }
                     _kind.value = runCatching { TransportKind.valueOf(kindName) }.getOrDefault(TransportKind.SSH)
                     if (!on && text.contains("断开")) lastDisconnectReason = text
                 }
@@ -94,6 +102,11 @@ object SessionClient {
                             size = p.getOrElse(2) { "0" }.toLongOrNull() ?: 0L,
                         )
                     }.toList()
+                }
+                SessionIpc.MSG_RESET -> {
+                    resets.forEach { r ->
+                        try { r() } catch (_: Exception) {}
+                    }
                 }
                 SessionIpc.MSG_LOG -> {
                     _log.value = msg.data.getString(SessionIpc.EXTRA_TEXT) ?: ""
@@ -144,25 +157,24 @@ object SessionClient {
         send(SessionIpc.MSG_SUBSCRIBE)
     }
 
+    fun onTerminalReset(reset: () -> Unit): () -> Unit {
+        resets.add(reset)
+        return { resets.remove(reset) }
+    }
+
     fun detachSink(sink: (ByteArray) -> Unit) {
         sinks.remove(sink)
     }
 
     fun connect(context: Context, profile: HostProfile) {
+        _held.value = true
+        _status.value = "正在连接 ${profile.host}:${profile.port}…"
         bind(context)
         SshSessionService.startConnect(context, profile)
-        val b = Bundle().apply {
-            putString(SessionIpc.EXTRA_HOST, profile.host)
-            putInt(SessionIpc.EXTRA_PORT, profile.port)
-            putString(SessionIpc.EXTRA_USER, profile.username)
-            putString(SessionIpc.EXTRA_PASS, profile.password)
-            putString(SessionIpc.EXTRA_KIND, profile.kind.name)
-            putString(SessionIpc.EXTRA_NAME, profile.name)
-        }
-        send(SessionIpc.MSG_CONNECT, b)
     }
 
     fun disconnect(context: Context) {
+        _held.value = false
         send(SessionIpc.MSG_DISCONNECT)
         context.startService(
             Intent(context, SshSessionService::class.java).setAction(SshSessionService.ACTION_DISCONNECT)
@@ -219,6 +231,7 @@ object SessionClient {
         lastDisconnectReason = message
         _status.value = message
         _connected.value = false
+        _held.value = false
     }
 
     fun refreshLog() {

@@ -34,6 +34,12 @@ object ProtectedSocket {
         socket.keepAlive = true
         socket.tcpNoDelay = true
         socket.soTimeout = 0
+        // 公网不要 bindSocket：1.5.0 日志里绑到 Network 120 后，切后台约 5 秒
+        // OEM 限制该 Network，整条 SSH 会话 RST（session=false）。局域网才绑 Wi-Fi 绕开 VPN。
+        if (!isLan(host)) {
+            SessionLog.event("WAN host $host, skip bindSocket (use default route)")
+            return
+        }
         val network = pickNetwork(host)
         if (network != null) {
             try {
