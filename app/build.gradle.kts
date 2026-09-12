@@ -12,8 +12,8 @@ android {
         applicationId = "com.sshtab.pad"
         minSdk = 26
         targetSdk = 36
-        versionCode = 9
-        versionName = "1.7.0"
+        versionCode = 10
+        versionName = "1.8.0"
     }
 
     buildTypes {
@@ -64,6 +64,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-service:2.8.7")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     implementation("androidx.media:media:1.7.0")
+    implementation("androidx.documentfile:documentfile:1.0.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
     implementation("com.github.mwiede:jsch:0.2.26")

@@ -8,12 +8,13 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
-import android.os.Looper
 import android.os.Message
 import android.os.Messenger
 import android.util.Log
+import com.sshtab.pad.ssh.AuthMethod
+import com.sshtab.pad.ssh.FileEntry
 import com.sshtab.pad.ssh.HostProfile
-import com.sshtab.pad.ssh.SshSessionManager
+import com.sshtab.pad.ssh.SessionInfo
 import com.sshtab.pad.ssh.TransportKind
 import java.nio.file.Files
 import java.nio.file.Path
@@ -27,10 +28,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
-/**
- * UI 进程入口。真正的 SSH 跑在 `:session` 进程里，切走应用只可能冻 UI，
- * 会话进程靠媒体保活 + 前台服务继续收 watch 输出并缓存。
- */
 object SessionClient {
     private const val TAG = "SessionClient"
 
@@ -49,11 +46,17 @@ object SessionClient {
     private val _remotePath = MutableStateFlow(".")
     val remotePath: StateFlow<String> = _remotePath.asStateFlow()
 
-    private val _files = MutableStateFlow<List<SshSessionManager.RemoteEntry>>(emptyList())
-    val files: StateFlow<List<SshSessionManager.RemoteEntry>> = _files.asStateFlow()
+    private val _files = MutableStateFlow<List<FileEntry>>(emptyList())
+    val files: StateFlow<List<FileEntry>> = _files.asStateFlow()
 
     private val _log = MutableStateFlow("")
     val log: StateFlow<String> = _log.asStateFlow()
+
+    private val _sessions = MutableStateFlow<List<SessionInfo>>(emptyList())
+    val sessions: StateFlow<List<SessionInfo>> = _sessions.asStateFlow()
+
+    private val _activeId = MutableStateFlow<String?>(null)
+    val activeId: StateFlow<String?> = _activeId.asStateFlow()
 
     @Volatile var lastDisconnectReason: String = ""
         private set
@@ -82,21 +85,42 @@ object SessionClient {
                     val text = msg.data.getString(SessionIpc.EXTRA_TEXT) ?: return
                     val on = msg.data.getBoolean(SessionIpc.EXTRA_CONNECTED)
                     val kindName = msg.data.getString(SessionIpc.EXTRA_KIND) ?: TransportKind.SSH.name
+                    val sid = msg.data.getString(SessionIpc.EXTRA_SID)
+                    if (sid != null) _activeId.value = sid
                     _status.value = text
                     _connected.value = on
-                    if (on) _held.value = true
-                    else if (text.contains("已断开") || text.contains("连接失败") || text.startsWith("请填写")) {
-                        _held.value = false
-                    }
+                    _held.value = _sessions.value.isNotEmpty() || on
                     _kind.value = runCatching { TransportKind.valueOf(kindName) }.getOrDefault(TransportKind.SSH)
                     if (!on && text.contains("断开")) lastDisconnectReason = text
+                }
+                SessionIpc.MSG_SESSIONS -> {
+                    val raw = msg.data.getString(SessionIpc.EXTRA_TEXT) ?: ""
+                    val list = raw.lineSequence().filter { it.isNotBlank() }.map { line ->
+                        val p = line.split('\t')
+                        SessionInfo(
+                            id = p.getOrElse(0) { "" },
+                            title = p.getOrElse(1) { "" },
+                            status = p.getOrElse(2) { "" },
+                            connected = p.getOrElse(3) { "0" } == "1",
+                            kind = runCatching { TransportKind.valueOf(p.getOrElse(4) { "SSH" }) }
+                                .getOrDefault(TransportKind.SSH),
+                        )
+                    }.toList()
+                    _sessions.value = list
+                    _held.value = list.isNotEmpty()
+                    val aid = msg.data.getString(SessionIpc.EXTRA_SID)
+                    if (aid != null) _activeId.value = aid
+                    if (list.isEmpty()) {
+                        _connected.value = false
+                        _status.value = "未连接"
+                    }
                 }
                 SessionIpc.MSG_FILES -> {
                     _remotePath.value = msg.data.getString(SessionIpc.EXTRA_PATH) ?: "."
                     val raw = msg.data.getString(SessionIpc.EXTRA_TEXT) ?: ""
                     _files.value = raw.lineSequence().filter { it.isNotBlank() }.map { line ->
                         val p = line.split('\t')
-                        SshSessionManager.RemoteEntry(
+                        FileEntry(
                             name = p.getOrElse(0) { "" },
                             isDirectory = p.getOrElse(1) { "0" } == "1",
                             size = p.getOrElse(2) { "0" }.toLongOrNull() ?: 0L,
@@ -173,12 +197,23 @@ object SessionClient {
         SshSessionService.startConnect(context, profile)
     }
 
+    fun switchSession(id: String) {
+        send(SessionIpc.MSG_SWITCH, Bundle().apply { putString(SessionIpc.EXTRA_SID, id) })
+    }
+
+    fun closeSession(id: String) {
+        send(SessionIpc.MSG_CLOSE, Bundle().apply { putString(SessionIpc.EXTRA_SID, id) })
+    }
+
     fun disconnect(context: Context) {
-        _held.value = false
-        send(SessionIpc.MSG_DISCONNECT)
-        context.startService(
-            Intent(context, SshSessionService::class.java).setAction(SshSessionService.ACTION_DISCONNECT)
-        )
+        val id = _activeId.value
+        if (id != null) closeSession(id)
+        else {
+            send(SessionIpc.MSG_DISCONNECT)
+            context.startService(
+                Intent(context, SshSessionService::class.java).setAction(SshSessionService.ACTION_DISCONNECT)
+            )
+        }
     }
 
     fun writeUtf8(text: String) {
@@ -197,6 +232,20 @@ object SessionClient {
     fun listRemote(path: String) {
         val b = Bundle().apply { putString(SessionIpc.EXTRA_PATH, path) }
         send(SessionIpc.MSG_LIST, b)
+    }
+
+    fun mkdir(name: String) {
+        send(SessionIpc.MSG_MKDIR, Bundle().apply { putString(SessionIpc.EXTRA_NAME, name) })
+    }
+
+    fun deleteRemote(name: String, isDir: Boolean) {
+        send(
+            SessionIpc.MSG_DELETE,
+            Bundle().apply {
+                putString(SessionIpc.EXTRA_NAME, name)
+                putBoolean(SessionIpc.EXTRA_IS_DIR, isDir)
+            },
+        )
     }
 
     fun download(remoteName: String, dest: Path) {
@@ -230,8 +279,6 @@ object SessionClient {
     fun fail(message: String) {
         lastDisconnectReason = message
         _status.value = message
-        _connected.value = false
-        _held.value = false
     }
 
     fun refreshLog() {
@@ -239,8 +286,7 @@ object SessionClient {
     }
 
     fun clearLog() {
-        _log.value = ""
-        send(SessionIpc.MSG_GET_LOG)
+        send(SessionIpc.MSG_CLEAR_LOG)
     }
 
     private fun send(what: Int, data: Bundle? = null, arg1: Int = 0) {

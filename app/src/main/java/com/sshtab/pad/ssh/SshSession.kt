@@ -32,16 +32,14 @@ import org.apache.commons.net.telnet.TelnetClient
 import org.apache.commons.net.telnet.TerminalTypeOptionHandler
 import org.apache.commons.net.telnet.WindowSizeOptionHandler
 
-/**
- * Process-scoped session. All socket I/O runs on [io] so Compose / WebView
- * never hits NetworkOnMainThreadException. Terminal bytes are pushed to
- * registered sinks (xterm.js), not a Compose TextField.
- */
-object SshSessionManager {
-    private const val TAG = "SshSessionManager"
+class SshSession(
+    val id: String,
+    private val onBytes: (String, ByteArray) -> Unit,
+) {
+    private val tag = "SshSession-$id"
 
     private val io = Executors.newSingleThreadExecutor { r ->
-        Thread(r, "session-io").apply { isDaemon = false }
+        Thread(r, "session-io-$id").apply { isDaemon = false }
     }
 
     private val _connected = MutableStateFlow(false)
@@ -56,21 +54,16 @@ object SshSessionManager {
     private val _remotePath = MutableStateFlow(".")
     val remotePath: StateFlow<String> = _remotePath.asStateFlow()
 
-    private val _files = MutableStateFlow<List<RemoteEntry>>(emptyList())
-    val files: StateFlow<List<RemoteEntry>> = _files.asStateFlow()
+    private val _files = MutableStateFlow<List<FileEntry>>(emptyList())
+    val files: StateFlow<List<FileEntry>> = _files.asStateFlow()
 
-    data class RemoteEntry(
-        val name: String,
-        val isDirectory: Boolean,
-        val size: Long,
-    )
-
+    @Volatile var currentProfile: HostProfile? = null
+        private set
     @Volatile private var jsch: JSch? = null
     @Volatile private var session: Session? = null
     @Volatile private var shell: ChannelShell? = null
     @Volatile private var telnet: TelnetClient? = null
     @Volatile private var outStream: OutputStream? = null
-    @Volatile private var currentProfile: HostProfile? = null
     @Volatile private var cols: Int = 120
     @Volatile private var rows: Int = 40
     private val alive = AtomicBoolean(false)
@@ -83,14 +76,6 @@ object SshSessionManager {
 
     fun attachSink(sink: (ByteArray) -> Unit) {
         if (!sinks.contains(sink)) sinks.add(sink)
-        val replay: List<ByteArray>
-        synchronized(scrollback) {
-            replay = scrollback.toList()
-        }
-        SessionLog.event("terminal attach, replay ${replay.size} chunks")
-        replay.forEach { chunk ->
-            try { sink(chunk) } catch (e: Exception) { Log.w(TAG, "replay", e) }
-        }
     }
 
     fun detachSink(sink: (ByteArray) -> Unit) {
@@ -110,20 +95,27 @@ object SshSessionManager {
         currentProfile = profile
         _kind.value = profile.kind
         _status.value = "正在连接 ${profile.host}:${profile.port}…"
-        SessionLog.event("connect ${profile.kind} ${profile.host}:${profile.port} user=${profile.username}")
+        SessionHub.notifyChange()
+        SessionLog.event("[$id] connect ${profile.kind} ${profile.host}:${profile.port} user=${profile.username} auth=${profile.auth}")
         emitLocal("\r\n\u001b[36mconnecting ${profile.host}:${profile.port} (${profile.kind})…\u001b[0m\r\n")
         when (profile.kind) {
             TransportKind.SSH -> connectSsh(profile)
             TransportKind.TELNET -> connectTelnet(profile)
         }
+        SessionHub.notifyChange()
     }
 
     private fun connectSsh(profile: HostProfile) {
         val client = JSch()
         jsch = client
+        if (profile.auth == AuthMethod.KEY && profile.privateKey.isNotBlank()) {
+            val keyBytes = profile.privateKey.toByteArray(StandardCharsets.UTF_8)
+            val pp = profile.passphrase.takeIf { it.isNotEmpty() }?.toByteArray(StandardCharsets.UTF_8)
+            client.addIdentity("key-$id", keyBytes, null, pp)
+        }
         val sess = client.getSession(profile.username, profile.host, profile.port)
-        sess.setPassword(profile.password)
-        sess.userInfo = passwordUserInfo(profile.password)
+        if (profile.password.isNotEmpty()) sess.setPassword(profile.password)
+        sess.userInfo = passwordUserInfo(profile.password, profile.passphrase)
         sess.setSocketFactory(ProtectedSocket.jschFactory(profile.host))
         val cfg = Properties()
         cfg["kex"] = listOf(
@@ -146,7 +138,10 @@ object SshSessionManager {
         ).joinToString(",")
         cfg["StrictHostKeyChecking"] = "no"
         cfg["HashKnownHosts"] = "no"
-        cfg["PreferredAuthentications"] = "password,keyboard-interactive"
+        cfg["PreferredAuthentications"] = if (profile.auth == AuthMethod.KEY)
+            "publickey,keyboard-interactive,password"
+        else
+            "password,keyboard-interactive"
         cfg["MaxAuthTries"] = "3"
         cfg["TCPKeepAlive"] = "yes"
         sess.setConfig(cfg)
@@ -167,14 +162,10 @@ object SshSessionManager {
         _connected.value = true
         _status.value = statusLine(profile)
         emitLocal("\u001b[32mconnected. type in the terminal.\u001b[0m\r\n")
-        SessionLog.event("ssh connected ${profile.username}@${profile.host}:${profile.port}")
-        Thread({ pump(ch.inputStream, fatalOnEof = true, label = "ssh-stdout") }, "ssh-stdout").apply { isDaemon = false }.start()
-        Thread({ pump(ch.extInputStream, fatalOnEof = false, label = "ssh-stderr") }, "ssh-stderr").apply { isDaemon = false }.start()
-        try {
-            listRemote(".")
-        } catch (e: Exception) {
-            Log.w(TAG, "sftp list after connect", e)
-        }
+        SessionLog.event("[$id] ssh connected ${profile.username}@${profile.host}:${profile.port}")
+        Thread({ pump(ch.inputStream, fatalOnEof = true, label = "ssh-stdout") }, "ssh-stdout-$id").apply { isDaemon = false }.start()
+        Thread({ pump(ch.extInputStream, fatalOnEof = false, label = "ssh-stderr") }, "ssh-stderr-$id").apply { isDaemon = false }.start()
+        try { listRemote(".") } catch (e: Exception) { Log.w(tag, "sftp list after connect", e) }
     }
 
     private fun connectTelnet(profile: HostProfile) {
@@ -189,7 +180,7 @@ object SshSessionManager {
             client.addOptionHandler(TerminalTypeOptionHandler("xterm-256color", false, false, true, false))
             client.addOptionHandler(WindowSizeOptionHandler(cols, rows, true, true, true, true))
         } catch (e: Exception) {
-            Log.w(TAG, "telnet options", e)
+            Log.w(tag, "telnet options", e)
         }
         client.connect(profile.host, profile.port)
         try {
@@ -201,7 +192,7 @@ object SshSessionManager {
             val sock = field?.get(client) as? java.net.Socket
             if (sock != null) ProtectedSocket.applyTcpKeepalive(sock)
         } catch (e: Exception) {
-            Log.w(TAG, "telnet socket opts", e)
+            Log.w(tag, "telnet socket opts", e)
         }
         telnet = client
         outStream = client.outputStream
@@ -210,8 +201,8 @@ object SshSessionManager {
         _connected.value = true
         _status.value = statusLine(profile)
         emitLocal("\u001b[32mtelnet connected. login inside the terminal.\u001b[0m\r\n")
-        SessionLog.event("telnet connected ${profile.host}:${profile.port}")
-        Thread({ pump(client.inputStream, fatalOnEof = true, label = "telnet") }, "telnet-stdout").apply { isDaemon = false }.start()
+        SessionLog.event("[$id] telnet connected ${profile.host}:${profile.port}")
+        Thread({ pump(client.inputStream, fatalOnEof = true, label = "telnet") }, "telnet-$id").apply { isDaemon = false }.start()
     }
 
     private fun pump(stream: InputStream, fatalOnEof: Boolean, label: String) {
@@ -225,34 +216,28 @@ object SshSessionManager {
             while (alive.get()) {
                 val n = stream.read(buf)
                 if (n < 0) {
-                    SessionLog.event("$label EOF session=${session?.isConnected} telnet=${telnet?.isConnected}")
+                    SessionLog.event("[$id] $label EOF session=${session?.isConnected} telnet=${telnet?.isConnected}")
                     break
                 }
                 if (n > 0) emit(buf.copyOf(n))
             }
         } catch (e: Exception) {
             detail = "$label ${e.javaClass.simpleName}: ${e.message}"
-            SessionLog.event("$label ended: ${e.javaClass.simpleName}: ${e.message}")
-            Log.w(TAG, "pump $label ended", e)
+            SessionLog.event("[$id] $label ended: ${e.javaClass.simpleName}: ${e.message}")
+            Log.w(tag, "pump $label ended", e)
         }
-        if (alive.get() && fatalOnEof) {
-            recoverOrFail(detail)
-        }
+        if (alive.get() && fatalOnEof) recoverOrFail(detail)
     }
 
-    /**
-     * stdout 关掉时：若 SSH 会话还在只重开 PTY。
-     * 会话也死了（国行冻进程后 TCP 被 NAT 掐）则自动重连，避免回到登录页。
-     */
     private fun recoverOrFail(detail: String) {
         val sess = session
         if (sess?.isConnected == true) {
-            SessionLog.event("stdout died ($detail) but SSH session live — reopen PTY")
+            SessionLog.event("[$id] stdout died ($detail) but SSH session live — reopen PTY")
             try {
                 reopenShell()
                 return
             } catch (t: Throwable) {
-                SessionLog.event("reopen shell failed: ${t.javaClass.simpleName}: ${t.message}")
+                SessionLog.event("[$id] reopen shell failed: ${t.javaClass.simpleName}: ${t.message}")
             }
         }
         if (requestAutoReconnect(detail)) return
@@ -263,21 +248,22 @@ object SshSessionManager {
         val profile = currentProfile ?: return false
         val n = reconnects.incrementAndGet()
         if (n > 5) {
-            SessionLog.event("auto-reconnect exhausted after $reason")
+            SessionLog.event("[$id] auto-reconnect exhausted after $reason")
             return false
         }
-        SessionLog.event("auto-reconnect $n/5 after $reason")
+        SessionLog.event("[$id] auto-reconnect $n/5 after $reason")
         _status.value = "连接中断，正在重连 ($n/5)…"
+        SessionHub.notifyChange()
         emitLocal("\r\n\u001b[33mconnection lost ($reason), reconnecting $n/5…\u001b[0m\r\n")
         Thread({
             try {
                 Thread.sleep(800L * n)
                 connect(profile)
             } catch (t: Throwable) {
-                SessionLog.event("auto-reconnect failed: ${describeError(t)}")
+                SessionLog.event("[$id] auto-reconnect failed: ${describeError(t)}")
                 fail("重连失败: ${describeError(t)}")
             }
-        }, "session-reconnect").apply { isDaemon = false }.start()
+        }, "reconnect-$id").apply { isDaemon = false }.start()
         return true
     }
 
@@ -294,9 +280,10 @@ object SshSessionManager {
         alive.set(true)
         _connected.value = true
         emitLocal("\r\n\u001b[33mshell reopened (session kept)\u001b[0m\r\n")
-        SessionLog.event("shell reopened cols=$cols rows=$rows")
-        Thread({ pump(ch.inputStream, fatalOnEof = true, label = "ssh-stdout") }, "ssh-stdout").apply { isDaemon = false }.start()
-        Thread({ pump(ch.extInputStream, fatalOnEof = false, label = "ssh-stderr") }, "ssh-stderr").apply { isDaemon = false }.start()
+        SessionLog.event("[$id] shell reopened cols=$cols rows=$rows")
+        Thread({ pump(ch.inputStream, fatalOnEof = true, label = "ssh-stdout") }, "ssh-stdout-$id").apply { isDaemon = false }.start()
+        Thread({ pump(ch.extInputStream, fatalOnEof = false, label = "ssh-stderr") }, "ssh-stderr-$id").apply { isDaemon = false }.start()
+        SessionHub.notifyChange()
     }
 
     fun write(data: ByteArray) {
@@ -307,8 +294,8 @@ object SshSessionManager {
                 out.write(data)
                 out.flush()
             } catch (e: Exception) {
-                Log.w(TAG, "write", e)
-                SessionLog.event("write error: ${describeError(e)}")
+                Log.w(tag, "write", e)
+                SessionLog.event("[$id] write error: ${describeError(e)}")
                 if (!isLive()) fail("发送失败: ${describeError(e)}")
             }
         }
@@ -316,11 +303,6 @@ object SshSessionManager {
 
     fun writeUtf8(text: String) {
         write(text.toByteArray(StandardCharsets.UTF_8))
-    }
-
-    /** Extra keys / leftover API. Never runs on the UI thread. */
-    fun sendCommand(line: String) {
-        writeUtf8(line + "\r")
     }
 
     fun resize(newCols: Int, newRows: Int) {
@@ -331,7 +313,7 @@ object SshSessionManager {
             try {
                 shell?.setPtySize(newCols, newRows, newCols * 8, newRows * 16)
             } catch (e: Exception) {
-                Log.w(TAG, "pty resize", e)
+                Log.w(tag, "pty resize", e)
             }
         }
     }
@@ -339,12 +321,12 @@ object SshSessionManager {
     fun listRemote(path: String) {
         withSftp { sftp ->
             val normalized = if (path.isBlank()) "." else path
-            val entries = mutableListOf<RemoteEntry>()
+            val entries = mutableListOf<FileEntry>()
             @Suppress("UNCHECKED_CAST")
             val listing = sftp.ls(normalized) as Vector<ChannelSftp.LsEntry>
             listing.forEach { e ->
                 val attrs: SftpATTRS = e.attrs
-                entries += RemoteEntry(
+                entries += FileEntry(
                     name = e.filename,
                     isDirectory = attrs.isDir,
                     size = attrs.size,
@@ -352,9 +334,10 @@ object SshSessionManager {
             }
             _remotePath.value = normalized
             _files.value = entries.sortedWith(
-                compareByDescending<RemoteEntry> { it.isDirectory }.thenBy { it.name.lowercase() }
+                compareByDescending<FileEntry> { it.isDirectory }.thenBy { it.name.lowercase() }
             )
         }
+        SessionHub.notifyChange()
     }
 
     fun download(remoteName: String, dest: Path) {
@@ -376,6 +359,20 @@ object SshSessionManager {
         listRemote(_remotePath.value)
     }
 
+    fun mkdir(name: String) {
+        val dir = join(_remotePath.value, name)
+        withSftp { it.mkdir(dir) }
+        listRemote(_remotePath.value)
+    }
+
+    fun deleteRemote(name: String, isDir: Boolean) {
+        val path = join(_remotePath.value, name)
+        withSftp { sftp ->
+            if (isDir) sftp.rmdir(path) else sftp.rm(path)
+        }
+        listRemote(_remotePath.value)
+    }
+
     private fun withSftp(block: (ChannelSftp) -> Unit) {
         val sess = session ?: throw IllegalStateException("当前不是 SSH 会话")
         if (!sess.isConnected) throw IllegalStateException("会话已断开")
@@ -391,8 +388,9 @@ object SshSessionManager {
     fun disconnect() {
         disconnectInternal()
         _status.value = "已断开"
-        SessionLog.disconnect("user disconnect")
+        SessionLog.disconnect("[$id] user disconnect")
         emitLocal("\r\n\u001b[33mdisconnected\u001b[0m\r\n")
+        SessionHub.notifyChange()
     }
 
     private fun disconnectInternal() {
@@ -426,7 +424,7 @@ object SshSessionManager {
                     out.write(byteArrayOf(0xFF.toByte(), 0xF1.toByte()))
                     out.flush()
                 } catch (e: Exception) {
-                    Log.w(TAG, "telnet nop", e)
+                    Log.w(tag, "telnet nop", e)
                 }
             }
             return true
@@ -447,16 +445,13 @@ object SshSessionManager {
             field?.isAccessible = true
             val sock = field?.get(sess) as? java.net.Socket ?: return
             ProtectedSocket.applyTcpKeepalive(sock)
-            SessionLog.event("hardened jsch socket $sock")
+            SessionLog.event("[$id] hardened jsch socket $sock")
         } catch (e: Exception) {
-            Log.w(TAG, "hardenSocket", e)
+            Log.w(tag, "hardenSocket", e)
         }
     }
 
-    private fun statusLine(profile: HostProfile): String = when (profile.kind) {
-        TransportKind.SSH -> "SSH ${profile.username}@${profile.host}:${profile.port}"
-        TransportKind.TELNET -> "TELNET ${profile.host}:${profile.port}"
-    }
+    private fun statusLine(profile: HostProfile): String = profile.title()
 
     private fun join(dir: String, name: String): String {
         if (dir == "." || dir.isBlank()) return name
@@ -467,8 +462,9 @@ object SshSessionManager {
         if (alive.get()) disconnectInternal()
         _connected.value = false
         _status.value = message
-        SessionLog.disconnect(message)
+        SessionLog.disconnect("[$id] $message")
         emitLocal("\r\n\u001b[31m$message\u001b[0m\r\n")
+        SessionHub.notifyChange()
     }
 
     fun describeError(t: Throwable): String =
@@ -489,17 +485,18 @@ object SshSessionManager {
                 scrollbackBytes -= scrollback.removeFirst().size
             }
         }
+        onBytes(id, chunk)
         sinks.forEach { sink ->
-            try { sink(chunk) } catch (e: Exception) { Log.w(TAG, "sink", e) }
+            try { sink(chunk) } catch (e: Exception) { Log.w(tag, "sink", e) }
         }
     }
 
-    private fun passwordUserInfo(password: String): UserInfo =
+    private fun passwordUserInfo(password: String, passphrase: String): UserInfo =
         object : UserInfo, UIKeyboardInteractive {
-            override fun getPassphrase(): String? = null
+            override fun getPassphrase(): String = passphrase
             override fun getPassword(): String = password
-            override fun promptPassword(message: String?) = true
-            override fun promptPassphrase(message: String?) = false
+            override fun promptPassword(message: String?) = password.isNotEmpty()
+            override fun promptPassphrase(message: String?) = passphrase.isNotEmpty()
             override fun promptYesNo(message: String?) = true
             override fun showMessage(message: String?) {}
             override fun promptKeyboardInteractive(

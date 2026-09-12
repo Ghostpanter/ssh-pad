@@ -30,8 +30,9 @@ import androidx.core.content.ContextCompat
 import com.sshtab.pad.MainActivity
 import com.sshtab.pad.R
 import com.sshtab.pad.log.SessionLog
+import com.sshtab.pad.ssh.AuthMethod
 import com.sshtab.pad.ssh.HostProfile
-import com.sshtab.pad.ssh.SshSessionManager
+import com.sshtab.pad.ssh.SessionHub
 import com.sshtab.pad.ssh.TransportKind
 import java.io.File
 import java.util.concurrent.CopyOnWriteArrayList
@@ -51,9 +52,6 @@ class SshSessionService : Service() {
         Process.setThreadPriority(Process.THREAD_PRIORITY_FOREGROUND)
     }
     private val listeners = CopyOnWriteArrayList<Messenger>()
-    private val ipcSink: (ByteArray) -> Unit = { bytes ->
-        broadcastOutput(bytes)
-    }
     private val messenger = Messenger(object : Handler(ipcThread.looper) {
         override fun handleMessage(msg: Message) = handleIpc(msg)
     })
@@ -63,7 +61,15 @@ class SshSessionService : Service() {
     override fun onCreate() {
         super.onCreate()
         SessionLog.event("session process onCreate pid=${Process.myPid()}")
-        SshSessionManager.attachSink(ipcSink)
+        SessionHub.outputSink = { sid, bytes ->
+            if (sid == SessionHub.activeId) broadcastOutput(bytes)
+        }
+        SessionHub.onChange = {
+            broadcastSessions()
+            broadcastStatus()
+            broadcastFiles()
+            updateNotification()
+        }
         player = KeepAlivePlayer(this)
         floatBubble = KeepAliveFloat(this)
     }
@@ -81,8 +87,8 @@ class SshSessionService : Service() {
                 ACTION_CONNECT -> handleConnect(intent)
                 ACTION_DISCONNECT -> handleDisconnect()
                 ACTION_ENSURE -> {
-                    SessionLog.event("FGS ensure, connected=${SshSessionManager.connected.value} live=${SshSessionManager.isLive()}")
-                    if (SshSessionManager.connected.value || SshSessionManager.isLive()) {
+                    SessionLog.event("FGS ensure, live=${SessionHub.anyLive()} n=${SessionHub.list().size}")
+                    if (SessionHub.anyLive()) {
                         startKeepAliveLoop()
                         player?.start()
                         floatBubble?.show()
@@ -90,8 +96,8 @@ class SshSessionService : Service() {
                 }
                 null -> {
                     SessionLog.event("FGS sticky restart")
-                    if (!SshSessionManager.isLive()) {
-                        loadSavedProfile()?.let { reconnect(it) }
+                    if (!SessionHub.anyLive()) {
+                        loadSavedProfile()?.let { openSession(it) }
                     } else {
                         startKeepAliveLoop()
                     }
@@ -99,7 +105,7 @@ class SshSessionService : Service() {
             }
         } catch (t: Throwable) {
             Log.e(TAG, "onStartCommand", t)
-            SshSessionManager.fail("服务异常: ${t.message}")
+            SessionHub.active()?.fail("服务异常: ${t.message}")
         }
         return START_STICKY
     }
@@ -118,12 +124,12 @@ class SshSessionService : Service() {
         SessionLog.event("task removed, keeping session")
         startInForegroundSafely()
         acquireLocks()
-        if (SshSessionManager.connected.value) startKeepAliveLoop()
+        if (SessionHub.anyLive()) startKeepAliveLoop()
     }
 
     override fun onDestroy() {
-        SessionLog.event("service onDestroy connected=${SshSessionManager.connected.value} live=${SshSessionManager.isLive()}")
-        val live = SshSessionManager.connected.value || SshSessionManager.isLive()
+        SessionLog.event("service onDestroy live=${SessionHub.anyLive()} n=${SessionHub.list().size}")
+        val live = SessionHub.anyLive()
         stopKeepAliveLoop()
         releaseLocks()
         releaseNetwork()
@@ -147,13 +153,16 @@ class SshSessionService : Service() {
         val kind = runCatching { TransportKind.valueOf(kindName) }.getOrDefault(TransportKind.SSH)
         val user = intent.getStringExtra(EXTRA_USER) ?: ""
         if (host.isNullOrBlank()) {
-            SshSessionManager.fail("主机为空")
+            SessionLog.event("connect rejected: empty host")
             return
         }
         if (kind == TransportKind.SSH && user.isBlank()) {
-            SshSessionManager.fail("主机或用户名为空")
+            SessionLog.event("connect rejected: empty user")
             return
         }
+        val auth = runCatching {
+            AuthMethod.valueOf(intent.getStringExtra(EXTRA_AUTH) ?: AuthMethod.PASSWORD.name)
+        }.getOrDefault(AuthMethod.PASSWORD)
         val profile = HostProfile(
             name = intent.getStringExtra(EXTRA_NAME) ?: user.ifBlank { host },
             host = host,
@@ -161,34 +170,43 @@ class SshSessionService : Service() {
             username = user,
             password = intent.getStringExtra(EXTRA_PASS) ?: "",
             kind = kind,
+            auth = auth,
+            privateKey = intent.getStringExtra(EXTRA_KEY) ?: "",
+            passphrase = intent.getStringExtra(EXTRA_PASSPHRASE) ?: "",
         )
         saveProfile(profile)
-        reconnect(profile)
+        openSession(profile)
     }
 
-    private fun reconnect(profile: HostProfile) {
+    private fun openSession(profile: HostProfile) {
         startKeepAliveLoop()
         thread(name = "session-connect", isDaemon = false) {
             try {
                 android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_FOREGROUND)
-                SshSessionManager.connect(profile)
+                SessionHub.open(profile)
                 player?.start()
                 floatBubble?.show()
+                sendReset(null)
+                replayScrollback(null)
+                broadcastSessions()
                 broadcastStatus()
+                broadcastFiles()
                 updateNotification()
             } catch (t: Throwable) {
                 Log.e(TAG, "connect failed", t)
-                SshSessionManager.fail("连接失败: ${SshSessionManager.describeError(t)}")
+                SessionLog.event("connect failed: ${t.javaClass.simpleName}: ${t.message}")
+                SessionHub.active()?.fail("连接失败: ${t.message}")
             }
         }
     }
 
     private fun handleDisconnect() {
         clearSavedProfile()
+        SessionHub.closeAll()
         stopKeepAliveLoop()
         player?.stop()
         floatBubble?.hide()
-        SshSessionManager.disconnect()
+        broadcastSessions()
         broadcastStatus()
         releaseLocks()
         releaseNetwork()
@@ -197,6 +215,16 @@ class SshSessionService : Service() {
         } catch (_: Throwable) {
         }
         stopSelf()
+    }
+
+    private fun maybeStopIfIdle() {
+        if (SessionHub.anyLive() || SessionHub.list().isNotEmpty()) {
+            broadcastSessions()
+            broadcastStatus()
+            updateNotification()
+            return
+        }
+        handleDisconnect()
     }
 
     private fun startKeepAliveLoop() {
@@ -224,25 +252,16 @@ class SshSessionService : Service() {
                     }
                 }
                 try {
-                    if (SshSessionManager.connected.value || SshSessionManager.isLive()) {
-                        val ok = SshSessionManager.keepAliveOnce()
+                    if (SessionHub.anyLive()) {
+                        val ok = SessionHub.keepAliveAll()
                         if (ticks % 2 == 0 || dt > 20_000L) {
-                            SessionLog.event("keepalive tick live=$ok dt=${dt}ms")
+                            SessionLog.event("keepalive tick live=$ok n=${SessionHub.list().size} dt=${dt}ms")
                             updateNotification()
                             broadcastStatus()
-                        }
-                        if (!ok && !SshSessionManager.isLive()) {
-                            SessionLog.event("keepalive saw dead session, auto-reconnect")
-                            if (!SshSessionManager.requestAutoReconnect("keepalive")) {
-                                loadSavedProfile()?.let { reconnect(it) }
-                            }
                         }
                     }
                 } catch (t: Throwable) {
                     SessionLog.event("keepalive error: ${t.javaClass.simpleName}: ${t.message}")
-                    if (!SshSessionManager.isLive()) {
-                        SshSessionManager.requestAutoReconnect(t.javaClass.simpleName)
-                    }
                 }
             }
         }, "session-keepalive")
@@ -439,10 +458,11 @@ class SshSessionService : Service() {
             this, 0, Intent(this, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val status = SshSessionManager.status.value
+        val status = SessionHub.active()?.status?.value ?: "会话保活中"
+        val n = SessionHub.list().size
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("SSH 会话运行中")
-            .setContentText(if (SshSessionManager.connected.value) status else getString(R.string.session_notification))
+            .setContentTitle(if (n > 1) "SSH 会话 ×$n" else "SSH 会话运行中")
+            .setContentText(if (SessionHub.anyLive()) status else getString(R.string.session_notification))
             .setSmallIcon(R.drawable.ic_stat_ssh)
             .setContentIntent(pi)
             .setOngoing(true)
@@ -499,6 +519,7 @@ class SshSessionService : Service() {
                 SessionIpc.MSG_SUBSCRIBE -> {
                     sendReset(replyTo)
                     replayScrollback(replyTo)
+                    broadcastSessions()
                     broadcastStatus()
                     broadcastFiles()
                     broadcastLog(replyTo)
@@ -511,6 +532,9 @@ class SshSessionService : Service() {
                     val kind = runCatching {
                         TransportKind.valueOf(b.getString(SessionIpc.EXTRA_KIND) ?: "SSH")
                     }.getOrDefault(TransportKind.SSH)
+                    val auth = runCatching {
+                        AuthMethod.valueOf(b.getString(SessionIpc.EXTRA_AUTH) ?: "PASSWORD")
+                    }.getOrDefault(AuthMethod.PASSWORD)
                     val profile = HostProfile(
                         name = b.getString(SessionIpc.EXTRA_NAME) ?: "",
                         host = b.getString(SessionIpc.EXTRA_HOST) ?: "",
@@ -518,27 +542,69 @@ class SshSessionService : Service() {
                         username = b.getString(SessionIpc.EXTRA_USER) ?: "",
                         password = b.getString(SessionIpc.EXTRA_PASS) ?: "",
                         kind = kind,
+                        auth = auth,
+                        privateKey = b.getString(SessionIpc.EXTRA_KEY) ?: "",
+                        passphrase = b.getString(SessionIpc.EXTRA_PASSPHRASE) ?: "",
                     )
                     saveProfile(profile)
-                    reconnect(profile)
+                    openSession(profile)
                 }
                 SessionIpc.MSG_DISCONNECT -> handleDisconnect()
+                SessionIpc.MSG_SWITCH -> {
+                    val sid = msg.data.getString(SessionIpc.EXTRA_SID) ?: return
+                    SessionHub.switchTo(sid)
+                    sendReset(null)
+                    replayScrollback(null)
+                    broadcastSessions()
+                    broadcastStatus()
+                    broadcastFiles()
+                }
+                SessionIpc.MSG_CLOSE -> {
+                    val sid = msg.data.getString(SessionIpc.EXTRA_SID) ?: return
+                    SessionHub.close(sid)
+                    sendReset(null)
+                    replayScrollback(null)
+                    maybeStopIfIdle()
+                }
+                SessionIpc.MSG_CLEAR_LOG -> {
+                    SessionLog.clear()
+                    broadcastLog(null)
+                }
                 SessionIpc.MSG_WRITE -> {
                     val bytes = msg.data.getByteArray(SessionIpc.EXTRA_BYTES) ?: return
-                    SshSessionManager.write(bytes)
+                    SessionHub.active()?.write(bytes)
                 }
                 SessionIpc.MSG_RESIZE -> {
-                    SshSessionManager.resize(
+                    SessionHub.active()?.resize(
                         msg.data.getInt(SessionIpc.EXTRA_COLS),
                         msg.data.getInt(SessionIpc.EXTRA_ROWS),
                     )
                 }
                 SessionIpc.MSG_LIST -> {
                     try {
-                        SshSessionManager.listRemote(msg.data.getString(SessionIpc.EXTRA_PATH) ?: ".")
+                        SessionHub.active()?.listRemote(msg.data.getString(SessionIpc.EXTRA_PATH) ?: ".")
                         broadcastFiles()
                     } catch (t: Throwable) {
                         SessionLog.event("list failed: ${t.message}")
+                    }
+                }
+                SessionIpc.MSG_MKDIR -> {
+                    try {
+                        SessionHub.active()?.mkdir(msg.data.getString(SessionIpc.EXTRA_NAME) ?: return)
+                        broadcastFiles()
+                    } catch (t: Throwable) {
+                        SessionLog.event("mkdir failed: ${t.message}")
+                    }
+                }
+                SessionIpc.MSG_DELETE -> {
+                    try {
+                        SessionHub.active()?.deleteRemote(
+                            msg.data.getString(SessionIpc.EXTRA_NAME) ?: return,
+                            msg.data.getBoolean(SessionIpc.EXTRA_IS_DIR),
+                        )
+                        broadcastFiles()
+                    } catch (t: Throwable) {
+                        SessionLog.event("delete failed: ${t.message}")
                     }
                 }
                 SessionIpc.MSG_DOWNLOAD -> {
@@ -546,7 +612,7 @@ class SshSessionService : Service() {
                     try {
                         val name = msg.data.getString(SessionIpc.EXTRA_NAME) ?: error("name")
                         val dest = File(msg.data.getString(SessionIpc.EXTRA_PATH)!!).toPath()
-                        SshSessionManager.download(name, dest)
+                        SessionHub.active()?.download(name, dest) ?: error("无会话")
                         reply(replyTo, id, true, null)
                     } catch (t: Throwable) {
                         reply(replyTo, id, false, t.message)
@@ -557,7 +623,7 @@ class SshSessionService : Service() {
                     try {
                         val name = msg.data.getString(SessionIpc.EXTRA_NAME) ?: error("name")
                         val src = File(msg.data.getString(SessionIpc.EXTRA_PATH)!!).toPath()
-                        SshSessionManager.upload(src, name)
+                        SessionHub.active()?.upload(src, name) ?: error("无会话")
                         broadcastFiles()
                         reply(replyTo, id, true, null)
                     } catch (t: Throwable) {
@@ -568,11 +634,12 @@ class SshSessionService : Service() {
                 SessionIpc.MSG_ENSURE -> {
                     startInForegroundSafely()
                     acquireLocks()
-                    if (SshSessionManager.connected.value || SshSessionManager.isLive()) {
+                    if (SessionHub.anyLive()) {
                         player?.start()
                         floatBubble?.show()
                         startKeepAliveLoop()
                     }
+                    broadcastSessions()
                     broadcastStatus()
                 }
             }
@@ -592,7 +659,7 @@ class SshSessionService : Service() {
     }
 
     private fun replayScrollback(to: Messenger?) {
-        val chunks = SshSessionManager.snapshotScrollback()
+        val chunks = SessionHub.active()?.snapshotScrollback().orEmpty()
         SessionLog.event("replay ${chunks.size} chunks to UI")
         val targets = if (to != null) listOf(to) else listeners.toList()
         for (chunk in chunks) {
@@ -622,14 +689,34 @@ class SshSessionService : Service() {
     }
 
     private fun broadcastStatus() {
+        val s = SessionHub.active()
         val dead = mutableListOf<Messenger>()
         for (m in listeners) {
             try {
                 val msg = Message.obtain(null, SessionIpc.MSG_STATUS)
                 msg.data = Bundle().apply {
-                    putString(SessionIpc.EXTRA_TEXT, SshSessionManager.status.value)
-                    putBoolean(SessionIpc.EXTRA_CONNECTED, SshSessionManager.connected.value)
-                    putString(SessionIpc.EXTRA_KIND, SshSessionManager.kind.value.name)
+                    putString(SessionIpc.EXTRA_TEXT, s?.status?.value ?: "未连接")
+                    putBoolean(SessionIpc.EXTRA_CONNECTED, s?.connected?.value == true)
+                    putString(SessionIpc.EXTRA_KIND, (s?.kind?.value ?: TransportKind.SSH).name)
+                    putString(SessionIpc.EXTRA_SID, SessionHub.activeId)
+                }
+                m.send(msg)
+            } catch (_: Throwable) {
+                dead += m
+            }
+        }
+        listeners.removeAll(dead)
+    }
+
+    private fun broadcastSessions() {
+        val dead = mutableListOf<Messenger>()
+        val text = SessionHub.encodeInfos()
+        for (m in listeners) {
+            try {
+                val msg = Message.obtain(null, SessionIpc.MSG_SESSIONS)
+                msg.data = Bundle().apply {
+                    putString(SessionIpc.EXTRA_TEXT, text)
+                    putString(SessionIpc.EXTRA_SID, SessionHub.activeId)
                 }
                 m.send(msg)
             } catch (_: Throwable) {
@@ -640,7 +727,8 @@ class SshSessionService : Service() {
     }
 
     private fun broadcastFiles() {
-        val text = SshSessionManager.files.value.joinToString("\n") {
+        val s = SessionHub.active()
+        val text = s?.files?.value.orEmpty().joinToString("\n") {
             "${it.name}\t${if (it.isDirectory) 1 else 0}\t${it.size}"
         }
         val dead = mutableListOf<Messenger>()
@@ -648,7 +736,7 @@ class SshSessionService : Service() {
             try {
                 val msg = Message.obtain(null, SessionIpc.MSG_FILES)
                 msg.data = Bundle().apply {
-                    putString(SessionIpc.EXTRA_PATH, SshSessionManager.remotePath.value)
+                    putString(SessionIpc.EXTRA_PATH, s?.remotePath?.value ?: ".")
                     putString(SessionIpc.EXTRA_TEXT, text)
                 }
                 m.send(msg)
@@ -696,6 +784,9 @@ class SshSessionService : Service() {
         const val EXTRA_USER = "user"
         const val EXTRA_PASS = "pass"
         const val EXTRA_KIND = "kind"
+        const val EXTRA_AUTH = "auth"
+        const val EXTRA_KEY = "key"
+        const val EXTRA_PASSPHRASE = "passphrase"
         private const val CHANNEL_ID = "ssh_keep_plain"
         private const val NOTIF_ID = 17
         private const val PREFS = "session"
@@ -717,6 +808,9 @@ class SshSessionService : Service() {
                 putExtra(EXTRA_USER, profile.username)
                 putExtra(EXTRA_PASS, profile.password)
                 putExtra(EXTRA_KIND, profile.kind.name)
+                putExtra(EXTRA_AUTH, profile.auth.name)
+                putExtra(EXTRA_KEY, profile.privateKey)
+                putExtra(EXTRA_PASSPHRASE, profile.passphrase)
             }
             try {
                 ContextCompat.startForegroundService(context, intent)
@@ -728,11 +822,9 @@ class SshSessionService : Service() {
                     Log.e(TAG, "startService failed", t2)
                     thread(name = "session-connect", isDaemon = false) {
                         try {
-                            SshSessionManager.connect(profile)
+                            SessionHub.open(profile)
                         } catch (t3: Throwable) {
-                            SshSessionManager.fail(
-                                "连接失败: ${SshSessionManager.describeError(t3)}"
-                            )
+                            SessionLog.event("connect failed: ${t3.message}")
                         }
                     }
                 }
@@ -741,7 +833,7 @@ class SshSessionService : Service() {
         }
 
         fun ensureRunning(context: Context) {
-            if (!SshSessionManager.connected.value && !SshSessionManager.isLive()) return
+            if (!SessionHub.anyLive()) return
             val intent = Intent(context, SshSessionService::class.java).setAction(ACTION_ENSURE)
             try {
                 ContextCompat.startForegroundService(context, intent)

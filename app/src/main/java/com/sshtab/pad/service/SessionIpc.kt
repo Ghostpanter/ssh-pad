@@ -12,6 +12,11 @@ object SessionIpc {
     const val MSG_UPLOAD = 9
     const val MSG_GET_LOG = 10
     const val MSG_ENSURE = 11
+    const val MSG_SWITCH = 12
+    const val MSG_CLOSE = 13
+    const val MSG_CLEAR_LOG = 14
+    const val MSG_MKDIR = 15
+    const val MSG_DELETE = 16
 
     const val MSG_OUTPUT = 100
     const val MSG_STATUS = 101
@@ -19,6 +24,7 @@ object SessionIpc {
     const val MSG_LOG = 103
     const val MSG_REPLY = 104
     const val MSG_RESET = 105
+    const val MSG_SESSIONS = 106
 
     const val EXTRA_HOST = "host"
     const val EXTRA_PORT = "port"
@@ -34,4 +40,9 @@ object SessionIpc {
     const val EXTRA_ERROR = "error"
     const val EXTRA_COLS = "cols"
     const val EXTRA_ROWS = "rows"
+    const val EXTRA_SID = "sid"
+    const val EXTRA_AUTH = "auth"
+    const val EXTRA_KEY = "key"
+    const val EXTRA_PASSPHRASE = "passphrase"
+    const val EXTRA_IS_DIR = "isdir"
 }
