@@ -72,7 +72,10 @@ class SshSession(
     private val sinks = CopyOnWriteArrayList<(ByteArray) -> Unit>()
     private val scrollback = ArrayDeque<ByteArray>()
     private var scrollbackBytes = 0
-    private const val SCROLLBACK_MAX = 1024 * 1024
+
+    companion object {
+        private const val SCROLLBACK_MAX = 1024 * 1024
+    }
 
     fun attachSink(sink: (ByteArray) -> Unit) {
         if (!sinks.contains(sink)) sinks.add(sink)
