@@ -10,6 +10,7 @@ import com.jcraft.jsch.UIKeyboardInteractive
 import com.jcraft.jsch.UserInfo
 import com.sshtab.pad.crypto.CryptoBootstrap
 import com.sshtab.pad.log.SessionLog
+import com.sshtab.pad.net.ProtectedSocket
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
@@ -21,6 +22,7 @@ import java.util.Vector
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -72,6 +74,7 @@ object SshSessionManager {
     @Volatile private var cols: Int = 120
     @Volatile private var rows: Int = 40
     private val alive = AtomicBoolean(false)
+    private val reconnects = AtomicInteger(0)
 
     private val sinks = CopyOnWriteArrayList<(ByteArray) -> Unit>()
     private val scrollback = ArrayDeque<ByteArray>()
@@ -119,6 +122,7 @@ object SshSessionManager {
         val sess = client.getSession(profile.username, profile.host, profile.port)
         sess.setPassword(profile.password)
         sess.userInfo = passwordUserInfo(profile.password)
+        sess.setSocketFactory(ProtectedSocket.jschFactory(profile.host))
         val cfg = Properties()
         cfg["kex"] = listOf(
             "ecdh-sha2-nistp256",
@@ -150,6 +154,7 @@ object SshSessionManager {
         sess.connect(20_000)
         session = sess
         hardenSocket(sess)
+        reconnects.set(0)
 
         val ch = sess.openChannel("shell") as ChannelShell
         ch.setPtyType("xterm-256color", cols, rows, cols * 8, rows * 16)
@@ -175,6 +180,7 @@ object SshSessionManager {
         client.connectTimeout = 20_000
         client.defaultTimeout = 0
         client.setReaderThread(true)
+        client.setSocketFactory(ProtectedSocket.javaxFactory(profile.host))
         try {
             client.addOptionHandler(EchoOptionHandler(false, false, true, false))
             client.addOptionHandler(SuppressGAOptionHandler(true, true, true, true))
@@ -188,12 +194,17 @@ object SshSessionManager {
             client.setKeepAlive(true)
             client.setTcpNoDelay(true)
             client.setSoTimeout(0)
+            val field = client.javaClass.superclass?.getDeclaredField("_socket_")
+            field?.isAccessible = true
+            val sock = field?.get(client) as? java.net.Socket
+            if (sock != null) ProtectedSocket.applyTcpKeepalive(sock)
         } catch (e: Exception) {
             Log.w(TAG, "telnet socket opts", e)
         }
         telnet = client
         outStream = client.outputStream
         alive.set(true)
+        reconnects.set(0)
         _connected.value = true
         _status.value = statusLine(profile)
         emitLocal("\u001b[32mtelnet connected. login inside the terminal.\u001b[0m\r\n")
@@ -203,22 +214,75 @@ object SshSessionManager {
 
     private fun pump(stream: InputStream, fatalOnEof: Boolean, label: String) {
         val buf = ByteArray(4096)
+        var detail = "$label EOF"
         try {
             while (alive.get()) {
                 val n = stream.read(buf)
                 if (n < 0) {
-                    SessionLog.event("$label EOF")
+                    SessionLog.event("$label EOF session=${session?.isConnected} telnet=${telnet?.isConnected}")
                     break
                 }
                 if (n > 0) emit(buf.copyOf(n))
             }
         } catch (e: Exception) {
+            detail = "$label ${e.javaClass.simpleName}: ${e.message}"
             SessionLog.event("$label ended: ${e.javaClass.simpleName}: ${e.message}")
             Log.w(TAG, "pump $label ended", e)
         }
         if (alive.get() && fatalOnEof) {
-            fail("连接已断开 ($label)")
+            recoverOrFail(detail)
         }
+    }
+
+    /**
+     * stdout/PTY 关掉不等于 SSH 会话死了。先重开 shell；
+     * 会话也死了则按上次配置自动重连（后台 VPN 切路由时常见）。
+     */
+    private fun recoverOrFail(detail: String) {
+        val sess = session
+        if (sess?.isConnected == true) {
+            SessionLog.event("stdout died ($detail) but SSH session live — reopen PTY")
+            try {
+                reopenShell()
+                return
+            } catch (t: Throwable) {
+                SessionLog.event("reopen shell failed: ${t.javaClass.simpleName}: ${t.message}")
+            }
+        }
+        val profile = currentProfile
+        val n = reconnects.incrementAndGet()
+        if (profile != null && n <= 3) {
+            SessionLog.event("auto-reconnect attempt $n after $detail")
+            _status.value = "连接中断，正在重连 ($n/3)…"
+            emitLocal("\r\n\u001b[33mconnection lost ($detail), reconnecting $n/3…\u001b[0m\r\n")
+            try {
+                Thread.sleep(1_200L * n)
+                connect(profile)
+            } catch (t: Throwable) {
+                SessionLog.event("reconnect failed: ${describeError(t)}")
+                fail("连接已断开 ($detail) 重连失败: ${describeError(t)}")
+            }
+            return
+        }
+        fail("连接已断开 ($detail)")
+    }
+
+    @Synchronized
+    private fun reopenShell() {
+        val sess = session ?: throw IllegalStateException("no session")
+        if (!sess.isConnected) throw IllegalStateException("session dead")
+        try { shell?.disconnect() } catch (_: Exception) {}
+        val ch = sess.openChannel("shell") as ChannelShell
+        ch.setPtyType("xterm-256color", cols, rows, cols * 8, rows * 16)
+        ch.connect(15_000)
+        shell = ch
+        outStream = ch.outputStream
+        alive.set(true)
+        _connected.value = true
+        emitLocal("\r\n\u001b[33mshell reopened (session kept)\u001b[0m\r\n")
+        SessionLog.event("shell reopened cols=$cols rows=$rows")
+        Thread({ pump(ch.inputStream, fatalOnEof = true, label = "ssh-stdout") }, "ssh-stdout").apply { isDaemon = false }.start()
+        Thread({ pump(ch.extInputStream, fatalOnEof = false, label = "ssh-stderr") }, "ssh-stderr").apply { isDaemon = false }.start()
     }
 
     fun write(data: ByteArray) {
@@ -368,9 +432,8 @@ object SshSessionManager {
             }
             field?.isAccessible = true
             val sock = field?.get(sess) as? java.net.Socket ?: return
-            sock.keepAlive = true
-            sock.tcpNoDelay = true
-            sock.soTimeout = 0
+            ProtectedSocket.applyTcpKeepalive(sock)
+            SessionLog.event("hardened jsch socket $sock")
         } catch (e: Exception) {
             Log.w(TAG, "hardenSocket", e)
         }

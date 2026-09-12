@@ -250,21 +250,31 @@ class SshSessionService : Service() {
         if (networkCallback != null) return
         try {
             val cm = getSystemService(CONNECTIVITY_SERVICE) as ConnectivityManager
+            // 不要要求 INTERNET：局域网 SSH（192.168.x）所在 Wi‑Fi 可能没有该 capability。
+            // 也不要绑到 VPN，否则切到后台时 VPN 一抖会话就断。
             val request = NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
                 .build()
             val cb = object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    Log.i(TAG, "network available $network")
+                    SessionLog.event("holdNetwork wifi available $network")
                 }
                 override fun onLost(network: Network) {
-                    Log.w(TAG, "network lost $network")
+                    SessionLog.event("holdNetwork wifi lost $network")
                 }
             }
             cm.requestNetwork(request, cb)
             networkCallback = cb
+            try {
+                val eth = NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET)
+                    .build()
+                cm.requestNetwork(eth, cb)
+            } catch (_: Throwable) {
+            }
         } catch (t: Throwable) {
             Log.w(TAG, "holdNetwork", t)
+            SessionLog.event("holdNetwork failed: ${t.message}")
         }
     }
 

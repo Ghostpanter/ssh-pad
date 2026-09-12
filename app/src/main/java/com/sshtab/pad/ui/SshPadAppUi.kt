@@ -165,10 +165,16 @@ fun SshPadAppUi() {
 @Composable
 private fun ConnectAndTerminal(modifier: Modifier, connected: Boolean) {
     val ctx = LocalContext.current
-    var kind by remember { mutableStateOf(TransportKind.SSH) }
-    var host by remember { mutableStateOf("192.168.1.1") }
-    var port by remember { mutableStateOf("22") }
-    var user by remember { mutableStateOf("root") }
+    val formPrefs = remember { ctx.getSharedPreferences("form", 0) }
+    var kind by remember {
+        mutableStateOf(
+            runCatching { TransportKind.valueOf(formPrefs.getString("kind", "SSH")!!) }
+                .getOrDefault(TransportKind.SSH),
+        )
+    }
+    var host by remember { mutableStateOf(formPrefs.getString("host", "") ?: "") }
+    var port by remember { mutableStateOf(formPrefs.getString("port", "22") ?: "22") }
+    var user by remember { mutableStateOf(formPrefs.getString("user", "") ?: "") }
     var pass by remember { mutableStateOf("") }
 
     Column(modifier.padding(12.dp)) {
@@ -237,6 +243,12 @@ private fun ConnectAndTerminal(modifier: Modifier, connected: Boolean) {
                             password = pass,
                             kind = kind,
                         )
+                        formPrefs.edit()
+                            .putString("host", profile.host)
+                            .putString("port", profile.port.toString())
+                            .putString("user", profile.username)
+                            .putString("kind", kind.name)
+                            .apply()
                         when {
                             profile.host.isBlank() -> SshSessionManager.fail("请填写主机")
                             kind == TransportKind.SSH && profile.username.isBlank() ->
@@ -248,7 +260,7 @@ private fun ConnectAndTerminal(modifier: Modifier, connected: Boolean) {
             }
             Spacer(Modifier.height(12.dp))
             Text(
-                "切到其他应用时请保留通知「后台保活中」。必须允许通知，否则系统会把会话冻死。",
+                "局域网地址会绑到 Wi‑Fi 而不是 VPN。切走时请保留「后台保活中」通知。",
                 style = MaterialTheme.typography.bodySmall,
             )
             if (SessionLog.lastDisconnectReason.isNotBlank()) {
