@@ -15,18 +15,27 @@ import android.net.NetworkRequest
 import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Message
+import android.os.Messenger
 import android.os.PowerManager
+import android.os.Process
 import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import androidx.media.app.NotificationCompat.MediaStyle
 import com.sshtab.pad.MainActivity
 import com.sshtab.pad.R
 import com.sshtab.pad.log.SessionLog
 import com.sshtab.pad.ssh.HostProfile
 import com.sshtab.pad.ssh.SshSessionManager
 import com.sshtab.pad.ssh.TransportKind
+import java.io.File
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
@@ -36,13 +45,28 @@ class SshSessionService : Service() {
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private val keepAliveRunning = AtomicBoolean(false)
     @Volatile private var keepAliveThread: Thread? = null
+    private var player: KeepAlivePlayer? = null
+    private var floatBubble: KeepAliveFloat? = null
+    private val ipcThread = HandlerThread("session-ipc").apply {
+        start()
+        Process.setThreadPriority(Process.THREAD_PRIORITY_FOREGROUND)
+    }
+    private val listeners = CopyOnWriteArrayList<Messenger>()
+    private val ipcSink: (ByteArray) -> Unit = { bytes ->
+        broadcastOutput(bytes)
+    }
+    private val messenger = Messenger(object : Handler(ipcThread.looper) {
+        override fun handleMessage(msg: Message) = handleIpc(msg)
+    })
 
-    override fun onBind(intent: Intent?): IBinder? = binder
-
-    private val binder = object : android.os.Binder() {}
+    override fun onBind(intent: Intent?): IBinder = messenger.binder
 
     override fun onCreate() {
         super.onCreate()
+        SessionLog.event("session process onCreate pid=${Process.myPid()}")
+        SshSessionManager.attachSink(ipcSink)
+        player = KeepAlivePlayer(this)
+        floatBubble = KeepAliveFloat(this)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -145,7 +169,11 @@ class SshSessionService : Service() {
         startKeepAliveLoop()
         thread(name = "session-connect", isDaemon = false) {
             try {
+                android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_FOREGROUND)
                 SshSessionManager.connect(profile)
+                player?.start()
+                floatBubble?.show()
+                broadcastStatus()
                 updateNotification()
             } catch (t: Throwable) {
                 Log.e(TAG, "connect failed", t)
@@ -157,7 +185,10 @@ class SshSessionService : Service() {
     private fun handleDisconnect() {
         clearSavedProfile()
         stopKeepAliveLoop()
+        player?.stop()
+        floatBubble?.hide()
         SshSessionManager.disconnect()
+        broadcastStatus()
         releaseLocks()
         releaseNetwork()
         try {
@@ -185,6 +216,7 @@ class SshSessionService : Service() {
                         if (ticks % 8 == 0) {
                             SessionLog.event("keepalive tick live=$ok")
                             updateNotification()
+                            broadcastStatus()
                         }
                         if (!ok && !SshSessionManager.isLive()) {
                             SshSessionManager.fail("连接已断开 (keepalive)")
@@ -293,6 +325,21 @@ class SshSessionService : Service() {
         val errors = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= 34) {
             val special = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            val media = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            try {
+                startForeground(NOTIF_ID, notification, special or media)
+                SessionLog.event("startForeground specialUse|mediaPlayback ok")
+                return
+            } catch (t: Throwable) {
+                errors += "combo:${t.javaClass.simpleName}:${t.message}"
+            }
+            try {
+                startForeground(NOTIF_ID, notification, media)
+                SessionLog.event("startForeground mediaPlayback ok")
+                return
+            } catch (t: Throwable) {
+                errors += "media:${t.javaClass.simpleName}"
+            }
             try {
                 startForeground(NOTIF_ID, notification, special)
                 SessionLog.event("startForeground specialUse ok")
@@ -361,7 +408,7 @@ class SshSessionService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val status = SshSessionManager.status.value
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(if (SshSessionManager.connected.value) "后台保活中 · $status" else getString(R.string.session_notification))
             .setSmallIcon(R.drawable.ic_stat_ssh)
@@ -369,9 +416,16 @@ class SshSessionService : Service() {
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
-            .build()
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+        try {
+            player?.mediaSession?.sessionToken?.let { token ->
+                builder.setStyle(MediaStyle().setMediaSession(token))
+            }
+        } catch (_: Throwable) {
+        }
+        return builder.build()
     }
 
     private fun saveProfile(profile: HostProfile) {
@@ -408,6 +462,172 @@ class SshSessionService : Service() {
             password = p.getString(KEY_PASS, "") ?: "",
             kind = kind,
         )
+    }
+
+    private fun handleIpc(msg: Message) {
+        val replyTo = msg.replyTo
+        if (replyTo != null && !listeners.contains(replyTo)) listeners.add(replyTo)
+        try {
+            when (msg.what) {
+                SessionIpc.MSG_SUBSCRIBE -> {
+                    broadcastStatus()
+                    broadcastFiles()
+                    broadcastLog(replyTo)
+                }
+                SessionIpc.MSG_UNSUBSCRIBE -> {
+                    msg.replyTo?.let { listeners.remove(it) }
+                }
+                SessionIpc.MSG_CONNECT -> {
+                    val b = msg.data
+                    val kind = runCatching {
+                        TransportKind.valueOf(b.getString(SessionIpc.EXTRA_KIND) ?: "SSH")
+                    }.getOrDefault(TransportKind.SSH)
+                    val profile = HostProfile(
+                        name = b.getString(SessionIpc.EXTRA_NAME) ?: "",
+                        host = b.getString(SessionIpc.EXTRA_HOST) ?: "",
+                        port = b.getInt(SessionIpc.EXTRA_PORT, 22),
+                        username = b.getString(SessionIpc.EXTRA_USER) ?: "",
+                        password = b.getString(SessionIpc.EXTRA_PASS) ?: "",
+                        kind = kind,
+                    )
+                    saveProfile(profile)
+                    reconnect(profile)
+                }
+                SessionIpc.MSG_DISCONNECT -> handleDisconnect()
+                SessionIpc.MSG_WRITE -> {
+                    val bytes = msg.data.getByteArray(SessionIpc.EXTRA_BYTES) ?: return
+                    SshSessionManager.write(bytes)
+                }
+                SessionIpc.MSG_RESIZE -> {
+                    SshSessionManager.resize(
+                        msg.data.getInt(SessionIpc.EXTRA_COLS),
+                        msg.data.getInt(SessionIpc.EXTRA_ROWS),
+                    )
+                }
+                SessionIpc.MSG_LIST -> {
+                    try {
+                        SshSessionManager.listRemote(msg.data.getString(SessionIpc.EXTRA_PATH) ?: ".")
+                        broadcastFiles()
+                    } catch (t: Throwable) {
+                        SessionLog.event("list failed: ${t.message}")
+                    }
+                }
+                SessionIpc.MSG_DOWNLOAD -> {
+                    val id = msg.arg1
+                    try {
+                        val name = msg.data.getString(SessionIpc.EXTRA_NAME) ?: error("name")
+                        val dest = File(msg.data.getString(SessionIpc.EXTRA_PATH)!!).toPath()
+                        SshSessionManager.download(name, dest)
+                        reply(replyTo, id, true, null)
+                    } catch (t: Throwable) {
+                        reply(replyTo, id, false, t.message)
+                    }
+                }
+                SessionIpc.MSG_UPLOAD -> {
+                    val id = msg.arg1
+                    try {
+                        val name = msg.data.getString(SessionIpc.EXTRA_NAME) ?: error("name")
+                        val src = File(msg.data.getString(SessionIpc.EXTRA_PATH)!!).toPath()
+                        SshSessionManager.upload(src, name)
+                        broadcastFiles()
+                        reply(replyTo, id, true, null)
+                    } catch (t: Throwable) {
+                        reply(replyTo, id, false, t.message)
+                    }
+                }
+                SessionIpc.MSG_GET_LOG -> broadcastLog(replyTo)
+                SessionIpc.MSG_ENSURE -> {
+                    startInForegroundSafely()
+                    acquireLocks()
+                    if (SshSessionManager.connected.value) {
+                        player?.start()
+                        floatBubble?.show()
+                        startKeepAliveLoop()
+                    }
+                    broadcastStatus()
+                }
+            }
+        } catch (t: Throwable) {
+            SessionLog.event("ipc ${msg.what}: ${t.javaClass.simpleName}: ${t.message}")
+        }
+    }
+
+    private fun broadcastOutput(bytes: ByteArray) {
+        val dead = mutableListOf<Messenger>()
+        for (m in listeners) {
+            try {
+                val msg = Message.obtain(null, SessionIpc.MSG_OUTPUT)
+                msg.data = Bundle().apply { putByteArray(SessionIpc.EXTRA_BYTES, bytes) }
+                m.send(msg)
+            } catch (_: Throwable) {
+                dead += m
+            }
+        }
+        listeners.removeAll(dead)
+    }
+
+    private fun broadcastStatus() {
+        val dead = mutableListOf<Messenger>()
+        for (m in listeners) {
+            try {
+                val msg = Message.obtain(null, SessionIpc.MSG_STATUS)
+                msg.data = Bundle().apply {
+                    putString(SessionIpc.EXTRA_TEXT, SshSessionManager.status.value)
+                    putBoolean(SessionIpc.EXTRA_CONNECTED, SshSessionManager.connected.value)
+                    putString(SessionIpc.EXTRA_KIND, SshSessionManager.kind.value.name)
+                }
+                m.send(msg)
+            } catch (_: Throwable) {
+                dead += m
+            }
+        }
+        listeners.removeAll(dead)
+    }
+
+    private fun broadcastFiles() {
+        val text = SshSessionManager.files.value.joinToString("\n") {
+            "${it.name}\t${if (it.isDirectory) 1 else 0}\t${it.size}"
+        }
+        val dead = mutableListOf<Messenger>()
+        for (m in listeners) {
+            try {
+                val msg = Message.obtain(null, SessionIpc.MSG_FILES)
+                msg.data = Bundle().apply {
+                    putString(SessionIpc.EXTRA_PATH, SshSessionManager.remotePath.value)
+                    putString(SessionIpc.EXTRA_TEXT, text)
+                }
+                m.send(msg)
+            } catch (_: Throwable) {
+                dead += m
+            }
+        }
+        listeners.removeAll(dead)
+    }
+
+    private fun broadcastLog(target: Messenger?) {
+        val snap = SessionLog.snapshot()
+        val targets = if (target != null) listOf(target) else listeners
+        for (m in targets) {
+            try {
+                val msg = Message.obtain(null, SessionIpc.MSG_LOG)
+                msg.data = Bundle().apply { putString(SessionIpc.EXTRA_TEXT, snap) }
+                m.send(msg)
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    private fun reply(to: Messenger?, id: Int, ok: Boolean, error: String?) {
+        if (to == null) return
+        try {
+            val msg = Message.obtain(null, SessionIpc.MSG_REPLY, id, 0)
+            msg.data = Bundle().apply {
+                putBoolean(SessionIpc.EXTRA_OK, ok)
+                putString(SessionIpc.EXTRA_ERROR, error)
+            }
+            to.send(msg)
+        } catch (_: Throwable) {
+        }
     }
 
     companion object {

@@ -1,6 +1,5 @@
 package com.sshtab.pad.ui
 
-import android.content.Intent
 import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -51,6 +50,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -63,10 +63,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import com.sshtab.pad.log.SessionLog
-import com.sshtab.pad.service.SshSessionService
+import com.sshtab.pad.service.KeepAliveOem
+import com.sshtab.pad.service.SessionClient
 import com.sshtab.pad.ssh.HostProfile
-import com.sshtab.pad.ssh.SshSessionManager
 import com.sshtab.pad.ssh.TransportKind
 import java.io.File
 import kotlinx.coroutines.Dispatchers
@@ -77,9 +76,9 @@ import kotlinx.coroutines.withContext
 @Composable
 fun SshPadAppUi() {
     var tab by remember { mutableIntStateOf(0) }
-    val connected by SshSessionManager.connected.collectAsState()
-    val status by SshSessionManager.status.collectAsState()
-    val kind by SshSessionManager.kind.collectAsState()
+    val connected by SessionClient.connected.collectAsState()
+    val status by SessionClient.status.collectAsState()
+    val kind by SessionClient.kind.collectAsState()
 
     Scaffold(
         topBar = {
@@ -250,22 +249,33 @@ private fun ConnectAndTerminal(modifier: Modifier, connected: Boolean) {
                             .putString("kind", kind.name)
                             .apply()
                         when {
-                            profile.host.isBlank() -> SshSessionManager.fail("请填写主机")
+                            profile.host.isBlank() -> SessionClient.fail("请填写主机")
                             kind == TransportKind.SSH && profile.username.isBlank() ->
-                                SshSessionManager.fail("请填写用户名")
-                            else -> SshSessionService.startConnect(ctx, profile)
+                                SessionClient.fail("请填写用户名")
+                            else -> {
+                                KeepAliveOem.requestOverlay(ctx)
+                                SessionClient.connect(ctx, profile)
+                            }
                         }
                     }) { Text("连接") }
                 }
             }
             Spacer(Modifier.height(12.dp))
             Text(
-                "局域网地址会绑到 Wi‑Fi 而不是 VPN。切走时请保留「后台保活中」通知。",
+                "会话在独立进程常驻。国行请点「保活设置」打开自启动/后台运行，并允许悬浮窗。切走后右上角会有 SSH 绿点。",
                 style = MaterialTheme.typography.bodySmall,
             )
-            if (SessionLog.lastDisconnectReason.isNotBlank()) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(onClick = { KeepAliveOem.openVendorKeepAlive(ctx) }) {
+                    Text("国行保活设置")
+                }
+                TextButton(onClick = { KeepAliveOem.requestOverlay(ctx) }) {
+                    Text("允许悬浮窗")
+                }
+            }
+            if (SessionClient.lastDisconnectReason.isNotBlank()) {
                 Text(
-                    "上次断开: ${SessionLog.lastDisconnectReason}",
+                    "上次断开: ${SessionClient.lastDisconnectReason}",
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodySmall,
                 )
@@ -276,11 +286,7 @@ private fun ConnectAndTerminal(modifier: Modifier, connected: Boolean) {
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 FilledTonalButton(onClick = {
-                    ctx.startService(
-                        Intent(ctx, SshSessionService::class.java).apply {
-                            action = SshSessionService.ACTION_DISCONNECT
-                        }
-                    )
+                    SessionClient.disconnect(ctx)
                 }) {
                     Icon(Icons.Default.LinkOff, null)
                     Spacer(Modifier.width(6.dp))
@@ -329,7 +335,7 @@ private fun ExtraKeysBar() {
         ) {
             keys.forEach { (label, seq) ->
                 FilledTonalButton(
-                    onClick = { SshSessionManager.writeUtf8(seq) },
+                    onClick = { SessionClient.writeUtf8(seq) },
                     modifier = Modifier.height(36.dp),
                 ) {
                     Text(label, fontSize = 12.sp)
@@ -342,9 +348,9 @@ private fun ExtraKeysBar() {
 @Composable
 private fun FilePane(modifier: Modifier, connected: Boolean) {
     val ctx = LocalContext.current
-    val files by SshSessionManager.files.collectAsState()
-    val path by SshSessionManager.remotePath.collectAsState()
-    val kind by SshSessionManager.kind.collectAsState()
+    val files by SessionClient.files.collectAsState()
+    val path by SessionClient.remotePath.collectAsState()
+    val kind by SessionClient.kind.collectAsState()
     val scope = rememberCoroutineScope()
     var pendingDownload by remember { mutableStateOf<String?>(null) }
     var message by remember { mutableStateOf("") }
@@ -358,7 +364,7 @@ private fun FilePane(modifier: Modifier, connected: Boolean) {
             try {
                 val tmp = File(ctx.cacheDir, name)
                 withContext(Dispatchers.IO) {
-                    SshSessionManager.download(name, tmp.toPath())
+                    SessionClient.download(name, tmp.toPath())
                     ctx.contentResolver.openOutputStream(uri)?.use { out ->
                         tmp.inputStream().use { it.copyTo(out) }
                     }
@@ -382,7 +388,7 @@ private fun FilePane(modifier: Modifier, connected: Boolean) {
                     ctx.contentResolver.openInputStream(uri)?.use { input ->
                         tmp.outputStream().use { input.copyTo(it) }
                     }
-                    SshSessionManager.upload(tmp.toPath(), name)
+                    SessionClient.upload(tmp.toPath(), name)
                 }
                 message = "已上传 $name"
             } catch (e: Exception) {
@@ -405,7 +411,7 @@ private fun FilePane(modifier: Modifier, connected: Boolean) {
                     onClick = {
                         scope.launch {
                             try {
-                                withContext(Dispatchers.IO) { SshSessionManager.listRemote(path) }
+                                withContext(Dispatchers.IO) { SessionClient.listRemote(path) }
                             } catch (e: Exception) {
                                 message = e.message ?: "刷新失败"
                             }
@@ -456,7 +462,7 @@ private fun FilePane(modifier: Modifier, connected: Boolean) {
                                     else -> if (path == "." || path.isBlank()) entry.name else "$path/${entry.name}"
                                 }
                                 try {
-                                    withContext(Dispatchers.IO) { SshSessionManager.listRemote(next) }
+                                    withContext(Dispatchers.IO) { SessionClient.listRemote(next) }
                                 } catch (e: Exception) {
                                     message = e.message ?: "打开失败"
                                 }
@@ -472,10 +478,11 @@ private fun FilePane(modifier: Modifier, connected: Boolean) {
 @Composable
 private fun LogPane(modifier: Modifier) {
     val ctx = LocalContext.current
-    val log by SessionLog.text.collectAsState()
+    val log by SessionClient.log.collectAsState()
     val scope = rememberCoroutineScope()
     var message by remember { mutableStateOf("") }
     val scroll = rememberScrollState()
+    LaunchedEffect(Unit) { SessionClient.refreshLog() }
     val saveLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("text/plain")
     ) { uri: Uri? ->
@@ -484,7 +491,7 @@ private fun LogPane(modifier: Modifier) {
             try {
                 withContext(Dispatchers.IO) {
                     ctx.contentResolver.openOutputStream(uri)?.use { out ->
-                        SessionLog.saveTo(out)
+                        out.write(SessionClient.log.value.toByteArray())
                     }
                 }
                 message = "已保存"
@@ -503,11 +510,11 @@ private fun LogPane(modifier: Modifier) {
                 Spacer(Modifier.width(6.dp))
                 Text("保存到本地")
             }
-            TextButton(onClick = { SessionLog.clear() }) { Text("清空") }
+            TextButton(onClick = { SessionClient.refreshLog() }) { Text("刷新") }
         }
         if (message.isNotBlank()) Text(message, color = MaterialTheme.colorScheme.primary)
         Text(
-            "含终端输出和保活/生命周期事件。切应用后若掉线，把本日志保存发过来即可定位。",
+            "日志在会话进程里记录。切走后 watch 的输出会继续写入，回来即可回看。",
             style = MaterialTheme.typography.bodySmall,
         )
         Spacer(Modifier.height(8.dp))

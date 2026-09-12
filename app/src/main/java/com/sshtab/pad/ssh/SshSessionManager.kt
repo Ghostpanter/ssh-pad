@@ -79,7 +79,7 @@ object SshSessionManager {
     private val sinks = CopyOnWriteArrayList<(ByteArray) -> Unit>()
     private val scrollback = ArrayDeque<ByteArray>()
     private var scrollbackBytes = 0
-    private const val SCROLLBACK_MAX = 256 * 1024
+    private const val SCROLLBACK_MAX = 1024 * 1024
 
     fun attachSink(sink: (ByteArray) -> Unit) {
         if (!sinks.contains(sink)) sinks.add(sink)
@@ -213,6 +213,10 @@ object SshSessionManager {
     }
 
     private fun pump(stream: InputStream, fatalOnEof: Boolean, label: String) {
+        try {
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_FOREGROUND)
+        } catch (_: Throwable) {
+        }
         val buf = ByteArray(4096)
         var detail = "$label EOF"
         try {
@@ -235,8 +239,8 @@ object SshSessionManager {
     }
 
     /**
-     * stdout/PTY 关掉不等于 SSH 会话死了。先重开 shell；
-     * 会话也死了则按上次配置自动重连（后台 VPN 切路由时常见）。
+     * stdout 关掉时：若 SSH 会话还在只重开 PTY（watch 所在的旧 PTY 已随通道
+     * SIGHUP）。不再自动新建整段 SSH——那会让用户误以为还在原会话里。
      */
     private fun recoverOrFail(detail: String) {
         val sess = session
@@ -248,21 +252,6 @@ object SshSessionManager {
             } catch (t: Throwable) {
                 SessionLog.event("reopen shell failed: ${t.javaClass.simpleName}: ${t.message}")
             }
-        }
-        val profile = currentProfile
-        val n = reconnects.incrementAndGet()
-        if (profile != null && n <= 3) {
-            SessionLog.event("auto-reconnect attempt $n after $detail")
-            _status.value = "连接中断，正在重连 ($n/3)…"
-            emitLocal("\r\n\u001b[33mconnection lost ($detail), reconnecting $n/3…\u001b[0m\r\n")
-            try {
-                Thread.sleep(1_200L * n)
-                connect(profile)
-            } catch (t: Throwable) {
-                SessionLog.event("reconnect failed: ${describeError(t)}")
-                fail("连接已断开 ($detail) 重连失败: ${describeError(t)}")
-            }
-            return
         }
         fail("连接已断开 ($detail)")
     }

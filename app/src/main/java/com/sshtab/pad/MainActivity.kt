@@ -52,7 +52,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onResume() {
         super.onResume()
-        SessionLog.event("activity onResume connected=${com.sshtab.pad.ssh.SshSessionManager.connected.value}")
+        SessionLog.event("activity onResume")
         SshSessionService.ensureRunning(this)
+        com.sshtab.pad.service.SessionClient.bind(this)
     }
 }

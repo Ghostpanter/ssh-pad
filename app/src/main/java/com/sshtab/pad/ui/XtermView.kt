@@ -15,7 +15,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import android.util.Base64
 import com.sshtab.pad.log.SessionLog
-import com.sshtab.pad.ssh.SshSessionManager
+import com.sshtab.pad.service.SessionClient
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
@@ -35,7 +35,7 @@ fun XtermView(modifier: Modifier = Modifier) {
 
     DisposableEffect(Unit) {
         onDispose {
-            SshSessionManager.detachSink(sink)
+            SessionClient.detachSink(sink)
             SessionLog.event("xterm disposed")
         }
     }
@@ -68,7 +68,7 @@ fun XtermView(modifier: Modifier = Modifier) {
                 addJavascriptInterface(XtermBridge(), "SshPad")
                 webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView?, url: String?) {
-                        SshSessionManager.attachSink(sink)
+                        SessionClient.attachSink(sink)
                         view?.evaluateJavascript("window.__fit && window.__fit()", null)
                         view?.requestFocus()
                     }
@@ -93,11 +93,11 @@ private object XtermHolder {
 private class XtermBridge {
     @JavascriptInterface
     fun onData(data: String) {
-        SshSessionManager.writeUtf8(data)
+        SessionClient.writeUtf8(data)
     }
 
     @JavascriptInterface
     fun onResize(cols: Int, rows: Int) {
-        SshSessionManager.resize(cols, rows)
+        SessionClient.resize(cols, rows)
     }
 }
