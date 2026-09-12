@@ -60,6 +60,16 @@ object SessionHub {
         notifyChange()
     }
 
+    /** 连接失败后从列表拿掉，不断开日志。 */
+    fun drop(id: String) {
+        val s = synchronized(lock) { sessions.remove(id) } ?: return
+        try { s.discard() } catch (_: Throwable) {}
+        if (activeId == id) {
+            activeId = synchronized(lock) { sessions.keys.lastOrNull() }
+        }
+        notifyChange()
+    }
+
     fun closeActive() {
         activeId?.let { close(it) }
     }

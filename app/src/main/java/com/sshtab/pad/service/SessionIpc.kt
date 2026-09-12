@@ -17,6 +17,7 @@ object SessionIpc {
     const val MSG_CLEAR_LOG = 14
     const val MSG_MKDIR = 15
     const val MSG_DELETE = 16
+    const val MSG_EVENT = 17
 
     const val MSG_OUTPUT = 100
     const val MSG_STATUS = 101

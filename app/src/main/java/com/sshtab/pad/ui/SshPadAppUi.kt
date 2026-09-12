@@ -90,6 +90,7 @@ import com.sshtab.pad.ssh.SessionInfo
 import com.sshtab.pad.ssh.TransportKind
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -277,6 +278,12 @@ private fun ConnectForm() {
     var keyName by remember { mutableStateOf("") }
     var passphrase by remember { mutableStateOf("") }
     var showPhrase by remember { mutableStateOf(false) }
+    val banner by SessionClient.banner.collectAsState()
+    LaunchedEffect(banner) {
+        if (banner.isBlank()) return@LaunchedEffect
+        delay(8_000)
+        if (SessionClient.banner.value == banner) SessionClient.clearBanner()
+    }
 
     val keyPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
@@ -421,9 +428,9 @@ private fun ConnectForm() {
             }
         }
         TextButton(onClick = { KeepAliveOem.openVendorKeepAlive(ctx) }) { Text("国行保活设置") }
-        if (SessionClient.lastDisconnectReason.isNotBlank()) {
+        if (banner.isNotBlank()) {
             Text(
-                SessionClient.lastDisconnectReason,
+                banner,
                 color = MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodySmall,
             )

@@ -52,6 +52,9 @@ object SessionClient {
     private val _log = MutableStateFlow("")
     val log: StateFlow<String> = _log.asStateFlow()
 
+    private val _banner = MutableStateFlow("")
+    val banner: StateFlow<String> = _banner.asStateFlow()
+
     private val _sessions = MutableStateFlow<List<SessionInfo>>(emptyList())
     val sessions: StateFlow<List<SessionInfo>> = _sessions.asStateFlow()
 
@@ -91,7 +94,10 @@ object SessionClient {
                     _connected.value = on
                     _held.value = _sessions.value.isNotEmpty() || on
                     _kind.value = runCatching { TransportKind.valueOf(kindName) }.getOrDefault(TransportKind.SSH)
-                    if (!on && text.contains("断开")) lastDisconnectReason = text
+                    if (!on && (text.contains("失败") || text.contains("连接已断开"))) {
+                        lastDisconnectReason = text
+                        _banner.value = text
+                    }
                 }
                 SessionIpc.MSG_SESSIONS -> {
                     val raw = msg.data.getString(SessionIpc.EXTRA_TEXT) ?: ""
@@ -278,7 +284,13 @@ object SessionClient {
 
     fun fail(message: String) {
         lastDisconnectReason = message
+        _banner.value = message
         _status.value = message
+        send(SessionIpc.MSG_EVENT, Bundle().apply { putString(SessionIpc.EXTRA_TEXT, message) })
+    }
+
+    fun clearBanner() {
+        _banner.value = ""
     }
 
     fun refreshLog() {

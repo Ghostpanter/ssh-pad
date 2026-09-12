@@ -570,6 +570,11 @@ class SshSessionService : Service() {
                     SessionLog.clear()
                     broadcastLog(null)
                 }
+                SessionIpc.MSG_EVENT -> {
+                    val text = msg.data.getString(SessionIpc.EXTRA_TEXT) ?: return
+                    SessionLog.event(text)
+                    broadcastLog(null)
+                }
                 SessionIpc.MSG_WRITE -> {
                     val bytes = msg.data.getByteArray(SessionIpc.EXTRA_BYTES) ?: return
                     SessionHub.active()?.write(bytes)

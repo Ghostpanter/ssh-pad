@@ -468,6 +468,16 @@ class SshSession(
         SessionLog.disconnect("[$id] $message")
         emitLocal("\r\n\u001b[31m$message\u001b[0m\r\n")
         SessionHub.notifyChange()
+        Thread({
+            try { Thread.sleep(8_000) } catch (_: InterruptedException) { return@Thread }
+            if (isLive() || connected.value) return@Thread
+            SessionLog.event("[$id] remove failed session from UI, kept in log")
+            SessionHub.drop(id)
+        }, "drop-fail-$id").apply { isDaemon = true }.start()
+    }
+
+    fun discard() {
+        disconnectInternal()
     }
 
     fun describeError(t: Throwable): String =
