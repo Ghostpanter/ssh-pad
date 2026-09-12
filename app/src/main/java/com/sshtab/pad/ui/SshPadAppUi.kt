@@ -1,6 +1,8 @@
 package com.sshtab.pad.ui
 
 import android.net.Uri
+import android.os.Build
+import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.horizontalScroll
@@ -263,7 +265,7 @@ private fun ConnectAndTerminal(modifier: Modifier, held: Boolean) {
             }
             Spacer(Modifier.height(12.dp))
             Text(
-                "会话在独立进程常驻。国行请点「保活设置」打开自启动/后台运行，并允许悬浮窗。切走后右上角会有 SSH 绿点。",
+                "会话在独立进程常驻。国行必须：① 点「保活设置」允许自启动和后台运行 ② 允许悬浮窗（否则切走几分钟会被冻死）。通知是普通「SSH 会话运行中」，不会再出音乐灵动岛。",
                 style = MaterialTheme.typography.bodySmall,
             )
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -292,6 +294,11 @@ private fun ConnectAndTerminal(modifier: Modifier, held: Boolean) {
                     Icon(Icons.Default.LinkOff, null)
                     Spacer(Modifier.width(6.dp))
                     Text("断开")
+                }
+                if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(ctx)) {
+                    TextButton(onClick = { KeepAliveOem.requestOverlay(ctx) }) {
+                        Text("未开悬浮窗，切走易断", color = MaterialTheme.colorScheme.error)
+                    }
                 }
             }
             Spacer(Modifier.height(8.dp))

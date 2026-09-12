@@ -27,7 +27,6 @@ import android.provider.Settings
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
-import androidx.media.app.NotificationCompat.MediaStyle
 import com.sshtab.pad.MainActivity
 import com.sshtab.pad.R
 import com.sshtab.pad.log.SessionLog
@@ -205,6 +204,7 @@ class SshSessionService : Service() {
         val t = Thread({
             var ticks = 0
             while (keepAliveRunning.get()) {
+                val t0 = android.os.SystemClock.elapsedRealtime()
                 try {
                     Thread.sleep(KEEPALIVE_MS)
                 } catch (_: InterruptedException) {
@@ -212,22 +212,36 @@ class SshSessionService : Service() {
                 }
                 if (!keepAliveRunning.get()) break
                 ticks++
+                val dt = android.os.SystemClock.elapsedRealtime() - t0
+                if (dt > 20_000L) {
+                    SessionLog.event("keepalive freeze dt=${dt}ms — restart audio/FGS")
+                    try {
+                        startInForegroundSafely()
+                        player?.start()
+                        floatBubble?.show()
+                    } catch (t: Throwable) {
+                        SessionLog.event("unfreeze recover: ${t.message}")
+                    }
+                }
                 try {
-                    if (SshSessionManager.connected.value) {
+                    if (SshSessionManager.connected.value || SshSessionManager.isLive()) {
                         val ok = SshSessionManager.keepAliveOnce()
-                        if (ticks % 8 == 0) {
-                            SessionLog.event("keepalive tick live=$ok")
+                        if (ticks % 2 == 0 || dt > 20_000L) {
+                            SessionLog.event("keepalive tick live=$ok dt=${dt}ms")
                             updateNotification()
                             broadcastStatus()
                         }
                         if (!ok && !SshSessionManager.isLive()) {
-                            SshSessionManager.fail("连接已断开 (keepalive)")
+                            SessionLog.event("keepalive saw dead session, auto-reconnect")
+                            if (!SshSessionManager.requestAutoReconnect("keepalive")) {
+                                loadSavedProfile()?.let { reconnect(it) }
+                            }
                         }
                     }
                 } catch (t: Throwable) {
                     SessionLog.event("keepalive error: ${t.javaClass.simpleName}: ${t.message}")
                     if (!SshSessionManager.isLive()) {
-                        SshSessionManager.fail("连接已断开: ${t.javaClass.simpleName}")
+                        SshSessionManager.requestAutoReconnect(t.javaClass.simpleName)
                     }
                 }
             }
@@ -413,7 +427,7 @@ class SshSessionService : Service() {
                     NotificationChannel(
                         CHANNEL_ID,
                         getString(R.string.session_channel),
-                        NotificationManager.IMPORTANCE_HIGH,
+                        NotificationManager.IMPORTANCE_LOW,
                     ).apply {
                         setShowBadge(false)
                         description = "保持 SSH / Telnet 会话在后台不断开"
@@ -427,22 +441,17 @@ class SshSessionService : Service() {
         )
         val status = SshSessionManager.status.value
         val builder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle(getString(R.string.app_name))
-            .setContentText(if (SshSessionManager.connected.value) "后台保活中 · $status" else getString(R.string.session_notification))
+            .setContentTitle("SSH 会话运行中")
+            .setContentText(if (SshSessionManager.connected.value) status else getString(R.string.session_notification))
             .setSmallIcon(R.drawable.ic_stat_ssh)
             .setContentIntent(pi)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
-            .setCategory(NotificationCompat.CATEGORY_TRANSPORT)
-            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
-        try {
-            player?.mediaSession?.sessionToken?.let { token ->
-                builder.setStyle(MediaStyle().setMediaSession(token))
-            }
-        } catch (_: Throwable) {
-        }
+            .setSilent(true)
         return builder.build()
     }
 
@@ -687,7 +696,7 @@ class SshSessionService : Service() {
         const val EXTRA_USER = "user"
         const val EXTRA_PASS = "pass"
         const val EXTRA_KIND = "kind"
-        private const val CHANNEL_ID = "ssh_keep_media"
+        private const val CHANNEL_ID = "ssh_keep_plain"
         private const val NOTIF_ID = 17
         private const val PREFS = "session"
         private const val KEY_RECONNECT = "reconnect"

@@ -241,8 +241,8 @@ object SshSessionManager {
     }
 
     /**
-     * stdout 关掉时：若 SSH 会话还在只重开 PTY（watch 所在的旧 PTY 已随通道
-     * SIGHUP）。不再自动新建整段 SSH——那会让用户误以为还在原会话里。
+     * stdout 关掉时：若 SSH 会话还在只重开 PTY。
+     * 会话也死了（国行冻进程后 TCP 被 NAT 掐）则自动重连，避免回到登录页。
      */
     private fun recoverOrFail(detail: String) {
         val sess = session
@@ -255,7 +255,30 @@ object SshSessionManager {
                 SessionLog.event("reopen shell failed: ${t.javaClass.simpleName}: ${t.message}")
             }
         }
+        if (requestAutoReconnect(detail)) return
         fail("连接已断开 ($detail)")
+    }
+
+    fun requestAutoReconnect(reason: String): Boolean {
+        val profile = currentProfile ?: return false
+        val n = reconnects.incrementAndGet()
+        if (n > 5) {
+            SessionLog.event("auto-reconnect exhausted after $reason")
+            return false
+        }
+        SessionLog.event("auto-reconnect $n/5 after $reason")
+        _status.value = "连接中断，正在重连 ($n/5)…"
+        emitLocal("\r\n\u001b[33mconnection lost ($reason), reconnecting $n/5…\u001b[0m\r\n")
+        Thread({
+            try {
+                Thread.sleep(800L * n)
+                connect(profile)
+            } catch (t: Throwable) {
+                SessionLog.event("auto-reconnect failed: ${describeError(t)}")
+                fail("重连失败: ${describeError(t)}")
+            }
+        }, "session-reconnect").apply { isDaemon = false }.start()
+        return true
     }
 
     @Synchronized
