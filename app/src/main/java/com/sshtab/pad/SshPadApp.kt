@@ -10,6 +10,7 @@ import com.sshtab.pad.crypto.CryptoBootstrap
 import com.sshtab.pad.log.SessionLog
 import com.sshtab.pad.service.SessionClient
 import com.sshtab.pad.service.SshSessionService
+import com.sshtab.pad.ui.AppSettings
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -22,6 +23,7 @@ class SshPadApp : Application() {
         super.onCreate()
         instance = this
         CryptoBootstrap.install()
+        AppSettings.init(this)
         SessionLog.init(File(filesDir, "logs"))
         SessionLog.event("app onCreate pid=${Process.myPid()} proc=${processName()}")
         if (!isSessionProcess()) {

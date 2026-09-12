@@ -37,6 +37,40 @@ object KeepAliveOem {
         }
     }
 
+    fun requestBattery(context: Context) {
+        if (Build.VERSION.SDK_INT < 23) return
+        try {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            if (pm.isIgnoringBatteryOptimizations(context.packageName)) return
+            context.startActivity(
+                Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:${context.packageName}"),
+                ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (t: Throwable) {
+            SessionLog.event("battery settings: $t")
+            try {
+                context.startActivity(
+                    Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                )
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
+    fun overlayGranted(context: Context): Boolean =
+        Build.VERSION.SDK_INT < 23 || Settings.canDrawOverlays(context)
+
+    fun batteryGranted(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < 23) return true
+        return try {
+            val pm = context.getSystemService(Context.POWER_SERVICE) as android.os.PowerManager
+            pm.isIgnoringBatteryOptimizations(context.packageName)
+        } catch (_: Throwable) { false }
+    }
+
     /** 打开该品牌的自启动 / 后台运行页，点不到就回落到应用详情。 */
     fun openVendorKeepAlive(context: Context) {
         val pkg = context.packageName

@@ -14,6 +14,7 @@ import android.util.Log
 import com.sshtab.pad.ssh.AuthMethod
 import com.sshtab.pad.ssh.FileEntry
 import com.sshtab.pad.ssh.HostProfile
+import com.sshtab.pad.ssh.ServerStats
 import com.sshtab.pad.ssh.SessionInfo
 import com.sshtab.pad.ssh.TransportKind
 import java.nio.file.Files
@@ -60,6 +61,9 @@ object SessionClient {
 
     private val _activeId = MutableStateFlow<String?>(null)
     val activeId: StateFlow<String?> = _activeId.asStateFlow()
+
+    private val _stats = MutableStateFlow<Map<String, ServerStats>>(emptyMap())
+    val stats: StateFlow<Map<String, ServerStats>> = _stats.asStateFlow()
 
     @Volatile var lastDisconnectReason: String = ""
         private set
@@ -120,6 +124,24 @@ object SessionClient {
                         _connected.value = false
                         _status.value = "未连接"
                     }
+                }
+                SessionIpc.MSG_STATS -> {
+                    val raw = msg.data.getString(SessionIpc.EXTRA_TEXT) ?: ""
+                    val map = mutableMapOf<String, ServerStats>()
+                    raw.lineSequence().filter { it.isNotBlank() }.forEach { line ->
+                        val p = line.split('\t')
+                        if (p.size >= 7) {
+                            map[p[0]] = ServerStats(
+                                load = p[1],
+                                cpuPercent = p[2].toIntOrNull() ?: -1,
+                                memUsedKb = p[3].toLongOrNull() ?: 0,
+                                memTotalKb = p[4].toLongOrNull() ?: 0,
+                                rxBps = p[5].toLongOrNull() ?: 0,
+                                txBps = p[6].toLongOrNull() ?: 0,
+                            )
+                        }
+                    }
+                    _stats.value = map
                 }
                 SessionIpc.MSG_FILES -> {
                     _remotePath.value = msg.data.getString(SessionIpc.EXTRA_PATH) ?: "."

@@ -59,6 +59,30 @@
     term.onData(function (d) {
       try { if (window.SshPad) SshPad.onData(d); } catch (e) {}
     });
+    window.__apply = function (dark, size) {
+      const ghDark = {
+        background: '#0d1117', foreground: '#e6edf3', cursor: '#58a6ff', cursorAccent: '#0d1117',
+        selectionBackground: '#1f6feb66',
+        black: '#484f58', red: '#ff7b72', green: '#3fb950', yellow: '#d29922',
+        blue: '#58a6ff', magenta: '#bc8cff', cyan: '#39d353', white: '#b1bac4',
+        brightBlack: '#6e7681', brightRed: '#ffa198', brightGreen: '#56d364', brightYellow: '#e3b341',
+        brightBlue: '#79c0ff', brightMagenta: '#d2a8ff', brightCyan: '#56d364', brightWhite: '#f0f6fc'
+      };
+      const ghLight = {
+        background: '#ffffff', foreground: '#1f2328', cursor: '#0969da', cursorAccent: '#ffffff',
+        selectionBackground: '#0969da33',
+        black: '#24292f', red: '#cf222e', green: '#1a7f37', yellow: '#9a6700',
+        blue: '#0969da', magenta: '#8250df', cyan: '#1b7c83', white: '#6e7781',
+        brightBlack: '#656d76', brightRed: '#fa4549', brightGreen: '#2da44e', brightYellow: '#bf8700',
+        brightBlue: '#218bff', brightMagenta: '#a475f9', brightCyan: '#3192aa', brightWhite: '#1f2328'
+      };
+      const t = dark ? ghDark : ghLight;
+      try { term.options.theme = t; } catch (e) {}
+      try { term.options.fontSize = size; } catch (e) {}
+      document.body.style.background = t.background;
+      document.documentElement.style.background = t.background;
+      doFit();
+    };
     window.__writeB64 = function (b64) {
       const bin = atob(b64);
       const arr = new Uint8Array(bin.length);

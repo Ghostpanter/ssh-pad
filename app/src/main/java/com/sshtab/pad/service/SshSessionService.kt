@@ -68,6 +68,7 @@ class SshSessionService : Service() {
             broadcastSessions()
             broadcastStatus()
             broadcastFiles()
+            broadcastStats()
             updateNotification()
         }
         player = KeepAlivePlayer(this)
@@ -188,9 +189,11 @@ class SshSessionService : Service() {
                 floatBubble?.show()
                 sendReset(null)
                 replayScrollback(null)
+                try { SessionHub.refreshAllStats() } catch (_: Throwable) {}
                 broadcastSessions()
                 broadcastStatus()
                 broadcastFiles()
+                broadcastStats()
                 updateNotification()
             } catch (t: Throwable) {
                 Log.e(TAG, "connect failed", t)
@@ -230,17 +233,19 @@ class SshSessionService : Service() {
     private fun startKeepAliveLoop() {
         if (!keepAliveRunning.compareAndSet(false, true)) return
         val t = Thread({
-            var ticks = 0
+            var lastKeep = 0L
+            var lastStats = 0L
+            var lastLog = 0L
             while (keepAliveRunning.get()) {
                 val t0 = android.os.SystemClock.elapsedRealtime()
                 try {
-                    Thread.sleep(KEEPALIVE_MS)
+                    Thread.sleep(1_000L)
                 } catch (_: InterruptedException) {
                     break
                 }
                 if (!keepAliveRunning.get()) break
-                ticks++
-                val dt = android.os.SystemClock.elapsedRealtime() - t0
+                val now = android.os.SystemClock.elapsedRealtime()
+                val dt = now - t0
                 if (dt > 20_000L) {
                     SessionLog.event("keepalive freeze dt=${dt}ms — restart audio/FGS")
                     try {
@@ -253,11 +258,21 @@ class SshSessionService : Service() {
                 }
                 try {
                     if (SessionHub.anyLive()) {
-                        val ok = SessionHub.keepAliveAll()
-                        if (ticks % 2 == 0 || dt > 20_000L) {
-                            SessionLog.event("keepalive tick live=$ok n=${SessionHub.list().size} dt=${dt}ms")
-                            updateNotification()
-                            broadcastStatus()
+                        if (now - lastKeep >= KEEPALIVE_MS) {
+                            lastKeep = now
+                            val ok = SessionHub.keepAliveAll()
+                            if (now - lastLog >= 16_000L || dt > 20_000L) {
+                                lastLog = now
+                                SessionLog.event("keepalive tick live=$ok n=${SessionHub.list().size} dt=${dt}ms")
+                                updateNotification()
+                                broadcastStatus()
+                            }
+                        }
+                        val intervalMs = com.sshtab.pad.ui.AppSettings.statusSecNow().coerceIn(3, 30) * 1000L
+                        if (now - lastStats >= intervalMs) {
+                            lastStats = now
+                            try { SessionHub.refreshAllStats() } catch (_: Throwable) {}
+                            broadcastStats()
                         }
                     }
                 } catch (t: Throwable) {
@@ -522,6 +537,7 @@ class SshSessionService : Service() {
                     broadcastSessions()
                     broadcastStatus()
                     broadcastFiles()
+                    broadcastStats()
                     broadcastLog(replyTo)
                 }
                 SessionIpc.MSG_UNSUBSCRIBE -> {
@@ -723,6 +739,21 @@ class SshSessionService : Service() {
                     putString(SessionIpc.EXTRA_TEXT, text)
                     putString(SessionIpc.EXTRA_SID, SessionHub.activeId)
                 }
+                m.send(msg)
+            } catch (_: Throwable) {
+                dead += m
+            }
+        }
+        listeners.removeAll(dead)
+    }
+
+    private fun broadcastStats() {
+        val dead = mutableListOf<Messenger>()
+        val text = SessionHub.encodeStats()
+        for (m in listeners) {
+            try {
+                val msg = Message.obtain(null, SessionIpc.MSG_STATS)
+                msg.data = Bundle().apply { putString(SessionIpc.EXTRA_TEXT, text) }
                 m.send(msg)
             } catch (_: Throwable) {
                 dead += m

@@ -10,16 +10,24 @@ import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import android.util.Base64
 import com.sshtab.pad.log.SessionLog
 import com.sshtab.pad.service.SessionClient
+import com.sshtab.pad.ui.theme.isDarkTheme
 
 @SuppressLint("SetJavaScriptEnabled")
 @Composable
 fun XtermView(modifier: Modifier = Modifier) {
+    val themeMode by AppSettings.theme.collectAsState()
+    val fontSize by AppSettings.fontSize.collectAsState()
+    val keepOn by AppSettings.keepScreenOn.collectAsState()
+    val dark = isDarkTheme(themeMode, isSystemInDarkTheme())
     val sink = remember {
         { bytes: ByteArray ->
             val holder = XtermHolder.webView
@@ -54,10 +62,10 @@ fun XtermView(modifier: Modifier = Modifier) {
                     ViewGroup.LayoutParams.MATCH_PARENT,
                     ViewGroup.LayoutParams.MATCH_PARENT,
                 )
-                setBackgroundColor(Color.parseColor("#0B1220"))
+                setBackgroundColor(Color.parseColor(if (dark) "#0D1117" else "#FFFFFF"))
                 isFocusable = true
                 isFocusableInTouchMode = true
-                keepScreenOn = true
+                keepScreenOn = keepOn
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 settings.allowFileAccess = true
@@ -75,6 +83,8 @@ fun XtermView(modifier: Modifier = Modifier) {
                 webViewClient = object : WebViewClient() {
                     override fun onPageFinished(view: WebView?, url: String?) {
                         SessionClient.attachSink(sink)
+                        val d = if (dark) "true" else "false"
+                        view?.evaluateJavascript("window.__apply && window.__apply($d, $fontSize)", null)
                         view?.evaluateJavascript("window.__fit && window.__fit()", null)
                         view?.requestFocus()
                     }
@@ -85,7 +95,11 @@ fun XtermView(modifier: Modifier = Modifier) {
         },
         update = { view ->
             XtermHolder.webView = view
+            view.keepScreenOn = keepOn
+            view.setBackgroundColor(Color.parseColor(if (dark) "#0D1117" else "#FFFFFF"))
+            val d = if (dark) "true" else "false"
             view.post {
+                view.evaluateJavascript("window.__apply && window.__apply($d, $fontSize)", null)
                 view.evaluateJavascript("window.__fit && window.__fit()", null)
             }
         },

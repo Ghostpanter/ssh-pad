@@ -107,6 +107,28 @@ object SessionHub {
             .joinToString("\t")
     }
 
+    fun encodeStats(): String = list().joinToString("\n") {
+        val st = it.stats.value
+        listOf(
+            it.id,
+            st.load,
+            st.cpuPercent.toString(),
+            st.memUsedKb.toString(),
+            st.memTotalKb.toString(),
+            st.rxBps.toString(),
+            st.txBps.toString(),
+        ).joinToString("\t")
+    }
+
+    fun refreshAllStats() {
+        list().forEach { s ->
+            try {
+                if (s.isLive() && s.kind.value == TransportKind.SSH) s.refreshStats()
+            } catch (_: Throwable) {
+            }
+        }
+    }
+
     fun notifyChange() {
         try { onChange?.invoke() } catch (_: Throwable) {}
     }

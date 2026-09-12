@@ -1,6 +1,7 @@
 package com.sshtab.pad.ssh
 
 import android.util.Log
+import com.jcraft.jsch.ChannelExec
 import com.jcraft.jsch.ChannelSftp
 import com.jcraft.jsch.ChannelShell
 import com.jcraft.jsch.JSch
@@ -11,6 +12,7 @@ import com.jcraft.jsch.UserInfo
 import com.sshtab.pad.crypto.CryptoBootstrap
 import com.sshtab.pad.log.SessionLog
 import com.sshtab.pad.net.ProtectedSocket
+import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
@@ -56,6 +58,14 @@ class SshSession(
 
     private val _files = MutableStateFlow<List<FileEntry>>(emptyList())
     val files: StateFlow<List<FileEntry>> = _files.asStateFlow()
+
+    private val _stats = MutableStateFlow(ServerStats())
+    val stats: StateFlow<ServerStats> = _stats.asStateFlow()
+    private var prevCpuIdle = -1L
+    private var prevCpuTotal = -1L
+    private var prevRx = -1L
+    private var prevTx = -1L
+    private var prevNetAt = 0L
 
     @Volatile var currentProfile: HostProfile? = null
         private set
@@ -248,6 +258,7 @@ class SshSession(
     }
 
     fun requestAutoReconnect(reason: String): Boolean {
+        if (!com.sshtab.pad.ui.AppSettings.autoReconnectNow()) return false
         val profile = currentProfile ?: return false
         val n = reconnects.incrementAndGet()
         if (n > 5) {
@@ -374,6 +385,87 @@ class SshSession(
             if (isDir) sftp.rmdir(path) else sftp.rm(path)
         }
         listRemote(_remotePath.value)
+    }
+
+    fun refreshStats() {
+        if (kind.value != TransportKind.SSH || session?.isConnected != true) return
+        val out = exec(
+            "echo LOAD \$(cut -d' ' -f1-3 /proc/loadavg 2>/dev/null); " +
+                "echo CPU \$(grep '^cpu ' /proc/stat 2>/dev/null); " +
+                "echo MEM \$(awk '/MemTotal:/{t=\$2} /MemAvailable:/{a=\$2} END{print t,a}' /proc/meminfo 2>/dev/null); " +
+                "echo NET \$(awk 'NR>2 {rx+=\$2; tx+=\$10} END{print rx,tx}' /proc/net/dev 2>/dev/null)",
+        )
+        var load = _stats.value.load
+        var cpu = _stats.value.cpuPercent
+        var memU = _stats.value.memUsedKb
+        var memT = _stats.value.memTotalKb
+        var rxBps = _stats.value.rxBps
+        var txBps = _stats.value.txBps
+        out.lineSequence().forEach { line ->
+            val p = line.trim().split(Regex("\\s+"))
+            when (p.firstOrNull()) {
+                "LOAD" -> load = p.drop(1).take(3).joinToString(" ")
+                "CPU" -> {
+                    // cpu user nice system idle iowait irq softirq steal
+                    if (p.size >= 6) {
+                        val user = p[1].toLongOrNull() ?: 0
+                        val nice = p[2].toLongOrNull() ?: 0
+                        val sys = p[3].toLongOrNull() ?: 0
+                        val idle = p[4].toLongOrNull() ?: 0
+                        val iow = p[5].toLongOrNull() ?: 0
+                        val irq = p.getOrNull(6)?.toLongOrNull() ?: 0
+                        val sirq = p.getOrNull(7)?.toLongOrNull() ?: 0
+                        val steal = p.getOrNull(8)?.toLongOrNull() ?: 0
+                        val idleAll = idle + iow
+                        val total = user + nice + sys + idleAll + irq + sirq + steal
+                        if (prevCpuTotal > 0 && total > prevCpuTotal) {
+                            val dIdle = idleAll - prevCpuIdle
+                            val dTotal = total - prevCpuTotal
+                            cpu = ((1.0 - dIdle.toDouble() / dTotal) * 100).toInt().coerceIn(0, 100)
+                        }
+                        prevCpuIdle = idleAll
+                        prevCpuTotal = total
+                    }
+                }
+                "MEM" -> {
+                    val t = p.getOrNull(1)?.toLongOrNull() ?: 0
+                    val a = p.getOrNull(2)?.toLongOrNull() ?: 0
+                    memT = t
+                    memU = (t - a).coerceAtLeast(0)
+                }
+                "NET" -> {
+                    val rx = p.getOrNull(1)?.toLongOrNull() ?: 0
+                    val tx = p.getOrNull(2)?.toLongOrNull() ?: 0
+                    val now = System.currentTimeMillis()
+                    if (prevNetAt > 0 && now > prevNetAt && prevRx >= 0) {
+                        val dt = (now - prevNetAt) / 1000.0
+                        rxBps = ((rx - prevRx).coerceAtLeast(0) / dt).toLong()
+                        txBps = ((tx - prevTx).coerceAtLeast(0) / dt).toLong()
+                    }
+                    prevRx = rx
+                    prevTx = tx
+                    prevNetAt = now
+                }
+            }
+        }
+        _stats.value = ServerStats(load, cpu, memU, memT, rxBps, txBps)
+    }
+
+    fun exec(cmd: String): String {
+        val sess = session ?: return ""
+        if (!sess.isConnected) return ""
+        val ch = sess.openChannel("exec") as ChannelExec
+        ch.setCommand(cmd)
+        val buf = ByteArrayOutputStream()
+        ch.outputStream = buf
+        ch.setErrStream(buf)
+        ch.connect(8_000)
+        val t0 = System.currentTimeMillis()
+        while (!ch.isClosed && System.currentTimeMillis() - t0 < 8_000) {
+            Thread.sleep(40)
+        }
+        try { ch.disconnect() } catch (_: Exception) {}
+        return buf.toString(Charsets.UTF_8)
     }
 
     private fun withSftp(block: (ChannelSftp) -> Unit) {

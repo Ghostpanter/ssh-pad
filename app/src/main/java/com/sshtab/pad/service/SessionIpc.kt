@@ -26,6 +26,7 @@ object SessionIpc {
     const val MSG_REPLY = 104
     const val MSG_RESET = 105
     const val MSG_SESSIONS = 106
+    const val MSG_STATS = 107
 
     const val EXTRA_HOST = "host"
     const val EXTRA_PORT = "port"

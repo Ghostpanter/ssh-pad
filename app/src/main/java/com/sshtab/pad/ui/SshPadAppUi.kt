@@ -1,12 +1,12 @@
 package com.sshtab.pad.ui
 
 import android.net.Uri
-import android.os.Build
-import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -33,15 +33,20 @@ import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CreateNewFolder
+import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
+import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
@@ -65,6 +70,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -73,7 +79,9 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -86,8 +94,11 @@ import com.sshtab.pad.service.SessionClient
 import com.sshtab.pad.ssh.AuthMethod
 import com.sshtab.pad.ssh.FileEntry
 import com.sshtab.pad.ssh.HostProfile
+import com.sshtab.pad.ssh.NodeStore
+import com.sshtab.pad.ssh.ServerStats
 import com.sshtab.pad.ssh.SessionInfo
 import com.sshtab.pad.ssh.TransportKind
+import com.sshtab.pad.ui.theme.isDarkTheme
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -102,21 +113,59 @@ fun SshPadAppUi() {
     val status by SessionClient.status.collectAsState()
     val kind by SessionClient.kind.collectAsState()
     val connected by SessionClient.connected.collectAsState()
+    val stats by SessionClient.stats.collectAsState()
+    val extraKeys by AppSettings.extraKeys.collectAsState()
+    val onboarded by AppSettings.onboarded.collectAsState()
+    val savedWidth by AppSettings.leftWidth.collectAsState()
+    val density = LocalDensity.current
+    var leftPx by remember { mutableFloatStateOf(with(density) { savedWidth.dp.toPx() }) }
+
+    if (!onboarded) OnboardDialog()
 
     BoxWithConstraints(Modifier.fillMaxSize().imePadding()) {
         val tablet = maxWidth >= 600.dp
+        val minPx = with(density) { 220.dp.toPx() }
+        val maxPx = with(density) { (maxWidth * 0.45f).toPx().coerceAtLeast(minPx + 40f) }
         Row(Modifier.fillMaxSize()) {
             if (tablet) {
                 LeftPanel(
                     modifier = Modifier
-                        .width(300.dp)
+                        .width(with(density) { leftPx.coerceIn(minPx, maxPx).toDp() })
                         .fillMaxHeight(),
                     sessions = sessions,
                     activeId = activeId,
+                    stats = stats,
                     tab = tab,
                     onTab = { tab = it },
                     filesEnabled = kind == TransportKind.SSH && connected,
                 )
+                Box(
+                    Modifier
+                        .width(14.dp)
+                        .fillMaxHeight()
+                        .background(MaterialTheme.colorScheme.background)
+                        .pointerInput(minPx, maxPx) {
+                            detectHorizontalDragGestures(
+                                onDragEnd = {
+                                    AppSettings.setLeftWidth(
+                                        with(density) { leftPx.coerceIn(minPx, maxPx).toDp().value.toInt() },
+                                    )
+                                },
+                                onHorizontalDrag = { _, drag ->
+                                    leftPx = (leftPx + drag).coerceIn(minPx, maxPx)
+                                },
+                            )
+                        },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Box(
+                        Modifier
+                            .width(3.dp)
+                            .height(56.dp)
+                            .clip(RoundedCornerShape(2.dp))
+                            .background(MaterialTheme.colorScheme.outline),
+                    )
+                }
             } else {
                 NavigationRail {
                     NavigationRailItem(
@@ -138,6 +187,12 @@ fun SshPadAppUi() {
                         icon = { Icon(Icons.Default.Description, null) },
                         label = { Text("日志") },
                     )
+                    NavigationRailItem(
+                        selected = tab == 3,
+                        onClick = { tab = 3 },
+                        icon = { Icon(Icons.Default.Settings, null) },
+                        label = { Text("设置") },
+                    )
                 }
             }
             Column(Modifier.weight(1f).fillMaxHeight()) {
@@ -145,9 +200,16 @@ fun SshPadAppUi() {
                     SessionChipRow(sessions, activeId)
                 }
                 when (tab) {
-                    0 -> TerminalPane(Modifier.fillMaxSize(), sessions.isNotEmpty(), status, showForm = !tablet)
+                    0 -> TerminalPane(
+                        Modifier.fillMaxSize(),
+                        sessions.isNotEmpty(),
+                        status,
+                        showForm = !tablet,
+                        showKeys = extraKeys,
+                    )
                     1 -> XftpPane(Modifier.fillMaxSize(), connected && kind == TransportKind.SSH)
-                    else -> LogPane(Modifier.fillMaxSize())
+                    2 -> LogPane(Modifier.fillMaxSize())
+                    else -> SettingsPane(Modifier.fillMaxSize())
                 }
             }
         }
@@ -159,65 +221,186 @@ private fun LeftPanel(
     modifier: Modifier,
     sessions: List<SessionInfo>,
     activeId: String?,
+    stats: Map<String, ServerStats>,
     tab: Int,
     onTab: (Int) -> Unit,
     filesEnabled: Boolean,
 ) {
-    Surface(modifier, tonalElevation = 2.dp) {
-        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(12.dp)) {
-            Text("SSH Pad", style = MaterialTheme.typography.titleLarge)
-            Text("多会话 · 终端占满右侧", style = MaterialTheme.typography.bodySmall)
-            Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+    val ctx = LocalContext.current
+    val theme by AppSettings.theme.collectAsState()
+    val dark = isDarkTheme(theme, isSystemInDarkTheme())
+    var nodes by remember { mutableStateOf(NodeStore.load(ctx)) }
+    var formOpen by remember { mutableStateOf(nodes.isEmpty()) }
+    fun reload() { nodes = NodeStore.load(ctx) }
+
+    Surface(modifier, color = MaterialTheme.colorScheme.surface) {
+        Column(Modifier.fillMaxSize()) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text("SSH Pad", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                IconButton(onClick = {
+                    AppSettings.setTheme(if (dark) "light" else "dark")
+                }, modifier = Modifier.size(32.dp)) {
+                    Icon(if (dark) Icons.Default.LightMode else Icons.Default.DarkMode, "主题", modifier = Modifier.size(18.dp))
+                }
+                IconButton(onClick = { onTab(3) }, modifier = Modifier.size(32.dp)) {
+                    Icon(Icons.Default.Settings, "设置", modifier = Modifier.size(18.dp))
+                }
+            }
+            Row(
+                Modifier.padding(horizontal = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(4.dp),
+            ) {
                 NavChip("终端", tab == 0) { onTab(0) }
                 NavChip("文件", tab == 1, enabled = filesEnabled) { onTab(1) }
                 NavChip("日志", tab == 2) { onTab(2) }
             }
-            Spacer(Modifier.height(12.dp))
-            Text("会话", style = MaterialTheme.typography.labelLarge)
-            if (sessions.isEmpty()) {
-                Text("尚未连接", style = MaterialTheme.typography.bodySmall)
-            } else {
-                sessions.forEach { s ->
-                    val selected = s.id == activeId
-                    Row(
-                        Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(8.dp))
-                            .background(
-                                if (selected) MaterialTheme.colorScheme.primaryContainer
-                                else MaterialTheme.colorScheme.surfaceVariant,
-                            )
-                            .clickable { SessionClient.switchSession(s.id) }
-                            .padding(horizontal = 8.dp, vertical = 6.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(Modifier.weight(1f)) {
-                            Text(
-                                s.title,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                style = MaterialTheme.typography.bodyMedium,
-                            )
-                            Text(
-                                s.status,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                                style = MaterialTheme.typography.bodySmall,
-                            )
-                        }
-                        IconButton(onClick = { SessionClient.closeSession(s.id) }, modifier = Modifier.size(32.dp)) {
-                            Icon(Icons.Default.Close, "关闭", modifier = Modifier.size(16.dp))
-                        }
-                    }
-                    Spacer(Modifier.height(4.dp))
+            Column(Modifier.weight(1f).verticalScroll(rememberScrollState()).padding(10.dp)) {
+                Text("节点", style = MaterialTheme.typography.labelLarge)
+                Spacer(Modifier.height(6.dp))
+                if (nodes.isEmpty() && sessions.isEmpty()) {
+                    Text("还没有保存的主机", style = MaterialTheme.typography.bodySmall)
+                }
+                nodes.forEach { node ->
+                    val live = sessions.firstOrNull { it.title == node.title() }
+                    NodeCard(
+                        node = node,
+                        session = live,
+                        selected = live?.id == activeId,
+                        stats = live?.let { stats[it.id] },
+                        onConnect = {
+                            SessionClient.connect(ctx, node)
+                        },
+                        onSelect = { live?.id?.let { SessionClient.switchSession(it) } },
+                        onClose = { live?.id?.let { SessionClient.closeSession(it) } },
+                        onDelete = {
+                            NodeStore.delete(ctx, node)
+                            reload()
+                        },
+                    )
+                    Spacer(Modifier.height(6.dp))
+                }
+                sessions.filter { s -> nodes.none { it.title() == s.title } }.forEach { s ->
+                    NodeCard(
+                        node = HostProfile(s.title, s.title.substringAfter('@').substringBefore(':'), 22, "root"),
+                        session = s,
+                        selected = s.id == activeId,
+                        stats = stats[s.id],
+                        canDelete = false,
+                        onConnect = {},
+                        onSelect = { SessionClient.switchSession(s.id) },
+                        onClose = { SessionClient.closeSession(s.id) },
+                        onDelete = {},
+                    )
+                    Spacer(Modifier.height(6.dp))
+                }
+                HorizontalDivider(Modifier.padding(vertical = 8.dp))
+                Row(
+                    Modifier.fillMaxWidth().clickable { formOpen = !formOpen },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text("新建连接", style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
+                    Icon(if (formOpen) Icons.Default.ExpandLess else Icons.Default.ExpandMore, null)
+                }
+                if (formOpen) {
+                    Spacer(Modifier.height(6.dp))
+                    ConnectForm(onSaved = { reload(); formOpen = false })
                 }
             }
-            HorizontalDivider(Modifier.padding(vertical = 12.dp))
-            Text("新建连接", style = MaterialTheme.typography.labelLarge)
-            Spacer(Modifier.height(6.dp))
-            ConnectForm()
         }
+    }
+}
+
+@Composable
+private fun NodeCard(
+    node: HostProfile,
+    session: SessionInfo?,
+    selected: Boolean,
+    stats: ServerStats?,
+    canDelete: Boolean = true,
+    onConnect: () -> Unit,
+    onSelect: () -> Unit,
+    onClose: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    val live = session?.connected == true
+    Column(
+        Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(
+                if (selected) MaterialTheme.colorScheme.primary.copy(alpha = 0.18f)
+                else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.55f),
+            )
+            .clickable { if (live) onSelect() else onConnect() }
+            .padding(horizontal = 10.dp, vertical = 8.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Box(
+                Modifier
+                    .size(8.dp)
+                    .clip(RoundedCornerShape(4.dp))
+                    .background(
+                        if (live) MaterialTheme.colorScheme.secondary
+                        else MaterialTheme.colorScheme.outline,
+                    ),
+            )
+            Spacer(Modifier.width(8.dp))
+            Column(Modifier.weight(1f)) {
+                Text(node.title(), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    if (live) "在线" else "未连接 · 点按连接",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = if (live) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (live) {
+                IconButton(onClick = onClose, modifier = Modifier.size(28.dp)) {
+                    Icon(Icons.Default.Close, "断开", modifier = Modifier.size(16.dp))
+                }
+            }
+            if (canDelete) {
+                IconButton(onClick = onDelete, modifier = Modifier.size(28.dp)) {
+                    Icon(Icons.Default.Delete, "删除节点", modifier = Modifier.size(16.dp))
+                }
+            }
+        }
+        if (live && stats != null) {
+            Spacer(Modifier.height(6.dp))
+            StatBar("CPU", if (stats.cpuPercent >= 0) "${stats.cpuPercent}%" else "…", (stats.cpuPercent.coerceAtLeast(0)) / 100f)
+            StatBar("MEM", stats.memText(), if (stats.memTotalKb > 0) stats.memUsedKb.toFloat() / stats.memTotalKb else 0f)
+            Text(
+                "NET ${stats.netText()}   load ${stats.load}",
+                style = MaterialTheme.typography.labelSmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+    }
+}
+
+@Composable
+private fun StatBar(label: String, value: String, progress: Float) {
+    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(vertical = 1.dp)) {
+        Text(label, modifier = Modifier.width(36.dp), style = MaterialTheme.typography.labelSmall)
+        Box(
+            Modifier
+                .weight(1f)
+                .height(6.dp)
+                .clip(RoundedCornerShape(3.dp))
+                .background(MaterialTheme.colorScheme.outline.copy(alpha = 0.4f)),
+        ) {
+            Box(
+                Modifier
+                    .fillMaxHeight()
+                    .fillMaxWidth(progress.coerceIn(0f, 1f))
+                    .background(MaterialTheme.colorScheme.secondary),
+            )
+        }
+        Spacer(Modifier.width(6.dp))
+        Text(value, style = MaterialTheme.typography.labelSmall)
     }
 }
 
@@ -254,7 +437,7 @@ private fun SessionChipRow(sessions: List<SessionInfo>, activeId: String?) {
 }
 
 @Composable
-private fun ConnectForm() {
+private fun ConnectForm(onSaved: () -> Unit = {}) {
     val ctx = LocalContext.current
     val formPrefs = remember { ctx.getSharedPreferences("form", 0) }
     var kind by remember {
@@ -411,8 +594,10 @@ private fun ConnectForm() {
                     kind == TransportKind.SSH && auth == AuthMethod.KEY && profile.privateKey.isBlank() ->
                         SessionClient.fail("请选择私钥")
                     else -> {
+                        NodeStore.upsert(ctx, profile, AppSettings.savePassword.value)
                         KeepAliveOem.requestOverlay(ctx)
                         SessionClient.connect(ctx, profile)
+                        onSaved()
                     }
                 }
             },
@@ -422,12 +607,6 @@ private fun ConnectForm() {
             Spacer(Modifier.width(6.dp))
             Text("连接 / 新开会话")
         }
-        if (Build.VERSION.SDK_INT >= 23 && !Settings.canDrawOverlays(ctx)) {
-            TextButton(onClick = { KeepAliveOem.requestOverlay(ctx) }) {
-                Text("未开悬浮窗，切走易断", color = MaterialTheme.colorScheme.error)
-            }
-        }
-        TextButton(onClick = { KeepAliveOem.openVendorKeepAlive(ctx) }) { Text("国行保活设置") }
         if (banner.isNotBlank()) {
             Text(
                 banner,
@@ -439,7 +618,7 @@ private fun ConnectForm() {
 }
 
 @Composable
-private fun TerminalPane(modifier: Modifier, hasSession: Boolean, status: String, showForm: Boolean) {
+private fun TerminalPane(modifier: Modifier, hasSession: Boolean, status: String, showForm: Boolean, showKeys: Boolean = true) {
     Column(modifier) {
         if (!hasSession) {
             if (showForm) {
@@ -457,10 +636,10 @@ private fun TerminalPane(modifier: Modifier, hasSession: Boolean, status: String
                 style = MaterialTheme.typography.labelSmall,
                 modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
             )
-            Card(Modifier.weight(1f).fillMaxWidth().padding(horizontal = 4.dp)) {
+            Card(Modifier.weight(1f).fillMaxWidth()) {
                 XtermView(Modifier.fillMaxSize())
             }
-            ExtraKeysBar()
+            if (showKeys) ExtraKeysBar()
         }
     }
 }
