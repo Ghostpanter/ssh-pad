@@ -58,13 +58,11 @@ object ProtectedSocket {
             val pfd = ParcelFileDescriptor.fromSocket(socket)
             val fd = pfd.fileDescriptor
             Os.setsockoptInt(fd, OsConstants.SOL_SOCKET, OsConstants.SO_KEEPALIVE, 1)
-            val idle = OsConstants.TCP_KEEPIDLE
-            val intvl = OsConstants.TCP_KEEPINTVL
-            val cnt = OsConstants.TCP_KEEPCNT
+            // Linux tcp.h — OsConstants.TCP_KEEP* is missing from the public SDK.
             val proto = OsConstants.IPPROTO_TCP
-            if (idle != 0) Os.setsockoptInt(fd, proto, idle, 5)
-            if (intvl != 0) Os.setsockoptInt(fd, proto, intvl, 3)
-            if (cnt != 0) Os.setsockoptInt(fd, proto, cnt, 8)
+            Os.setsockoptInt(fd, proto, 4 /* TCP_KEEPIDLE */, 5)
+            Os.setsockoptInt(fd, proto, 5 /* TCP_KEEPINTVL */, 3)
+            Os.setsockoptInt(fd, proto, 6 /* TCP_KEEPCNT */, 8)
             SessionLog.event("TCP_KEEPIDLE=5s KEEPINTVL=3s KEEPCNT=8")
             pfd.close()
         } catch (t: Throwable) {
