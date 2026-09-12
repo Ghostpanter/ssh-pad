@@ -193,6 +193,7 @@ object SessionClient {
 
     fun bind(context: Context) {
         appCtx = context.applicationContext
+        if (bound && outgoing != null) return
         val i = Intent(context, SshSessionService::class.java)
         try {
             context.applicationContext.bindService(
@@ -206,6 +207,9 @@ object SessionClient {
 
     fun attachSink(sink: (ByteArray) -> Unit) {
         if (!sinks.contains(sink)) sinks.add(sink)
+    }
+
+    fun resyncTerminal() {
         send(SessionIpc.MSG_SUBSCRIBE)
     }
 

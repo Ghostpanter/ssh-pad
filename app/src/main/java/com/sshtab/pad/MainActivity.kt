@@ -40,6 +40,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         SessionLog.event("activity onPause")
+        com.sshtab.pad.ui.XtermHost.pause()
         SshSessionService.ensureRunning(this)
         super.onPause()
     }
@@ -55,5 +56,6 @@ class MainActivity : ComponentActivity() {
         SessionLog.event("activity onResume")
         SshSessionService.ensureRunning(this)
         com.sshtab.pad.service.SessionClient.bind(this)
+        com.sshtab.pad.ui.XtermHost.resume()
     }
 }

@@ -12,8 +12,8 @@ android {
         applicationId = "com.sshtab.pad"
         minSdk = 26
         targetSdk = 36
-        versionCode = 12
-        versionName = "1.9.0"
+        versionCode = 13
+        versionName = "1.9.1"
     }
 
     buildTypes {

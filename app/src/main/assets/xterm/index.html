@@ -50,15 +50,52 @@
     const fit = new FitAddon.FitAddon();
     term.loadAddon(fit);
     term.open(document.getElementById('term'));
+
+    function helperTextarea() {
+      return document.querySelector('.xterm-helper-textarea');
+    }
+    function hardenTextarea() {
+      const ta = helperTextarea();
+      if (!ta) return;
+      ta.setAttribute('autocomplete', 'off');
+      ta.setAttribute('autocorrect', 'off');
+      ta.setAttribute('autocapitalize', 'none');
+      ta.setAttribute('spellcheck', 'false');
+      ta.setAttribute('aria-autocomplete', 'none');
+      ta.setAttribute('data-gramm', 'false');
+    }
+    function clearIme() {
+      const ta = helperTextarea();
+      if (!ta) return;
+      try {
+        ta.value = '';
+        if (ta.setSelectionRange) ta.setSelectionRange(0, 0);
+      } catch (e) {}
+    }
+    hardenTextarea();
+
+    let lastCols = 0, lastRows = 0;
     function doFit() {
       try { fit.fit(); } catch (e) {}
+      if (term.cols === lastCols && term.rows === lastRows) return;
+      lastCols = term.cols;
+      lastRows = term.rows;
       try { if (window.SshPad) SshPad.onResize(term.cols, term.rows); } catch (e) {}
     }
-    setTimeout(doFit, 30);
+    setTimeout(function () { hardenTextarea(); doFit(); }, 30);
     window.addEventListener('resize', doFit);
+
+    let lastChunk = '';
+    let lastAt = 0;
     term.onData(function (d) {
+      if (!d) return;
+      const now = Date.now();
+      if (d.length > 1 && d === lastChunk && now - lastAt < 16) return;
+      lastChunk = d;
+      lastAt = now;
       try { if (window.SshPad) SshPad.onData(d); } catch (e) {}
     });
+
     window.__apply = function (dark, size) {
       const ghDark = {
         background: '#0d1117', foreground: '#e6edf3', cursor: '#58a6ff', cursorAccent: '#0d1117',
@@ -91,9 +128,29 @@
     };
     window.__fit = doFit;
     window.__focus = function () { term.focus(); };
-    window.__reset = function () { term.reset(); doFit(); };
+    window.__reset = function () { clearIme(); term.reset(); lastCols = 0; lastRows = 0; doFit(); };
+    window.__sleep = function () {
+      const ta = helperTextarea();
+      if (ta) {
+        try { ta.blur(); } catch (e) {}
+        clearIme();
+      }
+    };
+    window.__wake = function () {
+      hardenTextarea();
+      clearIme();
+      try { term.focus(); } catch (e) {}
+      doFit();
+    };
+    document.addEventListener('visibilitychange', function () {
+      if (document.hidden) window.__sleep();
+      else window.__wake();
+    });
     document.addEventListener('click', function () { term.focus(); });
-    document.addEventListener('touchend', function () { term.focus(); });
+    document.addEventListener('touchend', function () {
+      const ta = helperTextarea();
+      if (ta && document.activeElement !== ta) term.focus();
+    });
   </script>
 </body>
 </html>
