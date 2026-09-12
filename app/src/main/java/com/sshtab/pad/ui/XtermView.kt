@@ -14,6 +14,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.viewinterop.AndroidView
 import android.util.Base64
+import com.sshtab.pad.log.SessionLog
 import com.sshtab.pad.ssh.SshSessionManager
 
 @SuppressLint("SetJavaScriptEnabled")
@@ -35,7 +36,7 @@ fun XtermView(modifier: Modifier = Modifier) {
     DisposableEffect(Unit) {
         onDispose {
             SshSessionManager.detachSink(sink)
-            XtermHolder.webView = null
+            SessionLog.event("xterm disposed")
         }
     }
 

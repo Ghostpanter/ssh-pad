@@ -9,6 +9,7 @@ import com.jcraft.jsch.SftpATTRS
 import com.jcraft.jsch.UIKeyboardInteractive
 import com.jcraft.jsch.UserInfo
 import com.sshtab.pad.crypto.CryptoBootstrap
+import com.sshtab.pad.log.SessionLog
 import java.io.InputStream
 import java.io.OutputStream
 import java.nio.charset.StandardCharsets
@@ -73,14 +74,19 @@ object SshSessionManager {
     private val alive = AtomicBoolean(false)
 
     private val sinks = CopyOnWriteArrayList<(ByteArray) -> Unit>()
-    private val backlog = ArrayDeque<ByteArray>()
-    private const val BACKLOG_MAX = 256
+    private val scrollback = ArrayDeque<ByteArray>()
+    private var scrollbackBytes = 0
+    private const val SCROLLBACK_MAX = 256 * 1024
 
     fun attachSink(sink: (ByteArray) -> Unit) {
         if (!sinks.contains(sink)) sinks.add(sink)
-        synchronized(backlog) {
-            backlog.forEach { sink(it) }
-            backlog.clear()
+        val replay: List<ByteArray>
+        synchronized(scrollback) {
+            replay = scrollback.toList()
+        }
+        SessionLog.event("terminal attach, replay ${replay.size} chunks")
+        replay.forEach { chunk ->
+            try { sink(chunk) } catch (e: Exception) { Log.w(TAG, "replay", e) }
         }
     }
 
@@ -99,6 +105,7 @@ object SshSessionManager {
         currentProfile = profile
         _kind.value = profile.kind
         _status.value = "正在连接 ${profile.host}:${profile.port}…"
+        SessionLog.event("connect ${profile.kind} ${profile.host}:${profile.port} user=${profile.username}")
         emitLocal("\r\n\u001b[36mconnecting ${profile.host}:${profile.port} (${profile.kind})…\u001b[0m\r\n")
         when (profile.kind) {
             TransportKind.SSH -> connectSsh(profile)
@@ -153,8 +160,9 @@ object SshSessionManager {
         _connected.value = true
         _status.value = statusLine(profile)
         emitLocal("\u001b[32mconnected. type in the terminal.\u001b[0m\r\n")
-        Thread({ pump(ch.inputStream) }, "ssh-stdout").apply { isDaemon = false }.start()
-        Thread({ pump(ch.extInputStream) }, "ssh-stderr").apply { isDaemon = false }.start()
+        SessionLog.event("ssh connected ${profile.username}@${profile.host}:${profile.port}")
+        Thread({ pump(ch.inputStream, fatalOnEof = true, label = "ssh-stdout") }, "ssh-stdout").apply { isDaemon = false }.start()
+        Thread({ pump(ch.extInputStream, fatalOnEof = false, label = "ssh-stderr") }, "ssh-stderr").apply { isDaemon = false }.start()
         try {
             listRemote(".")
         } catch (e: Exception) {
@@ -189,22 +197,27 @@ object SshSessionManager {
         _connected.value = true
         _status.value = statusLine(profile)
         emitLocal("\u001b[32mtelnet connected. login inside the terminal.\u001b[0m\r\n")
-        Thread({ pump(client.inputStream) }, "telnet-stdout").apply { isDaemon = false }.start()
+        SessionLog.event("telnet connected ${profile.host}:${profile.port}")
+        Thread({ pump(client.inputStream, fatalOnEof = true, label = "telnet") }, "telnet-stdout").apply { isDaemon = false }.start()
     }
 
-    private fun pump(stream: InputStream) {
+    private fun pump(stream: InputStream, fatalOnEof: Boolean, label: String) {
         val buf = ByteArray(4096)
         try {
             while (alive.get()) {
                 val n = stream.read(buf)
-                if (n < 0) break
+                if (n < 0) {
+                    SessionLog.event("$label EOF")
+                    break
+                }
                 if (n > 0) emit(buf.copyOf(n))
             }
         } catch (e: Exception) {
-            Log.w(TAG, "pump ended", e)
+            SessionLog.event("$label ended: ${e.javaClass.simpleName}: ${e.message}")
+            Log.w(TAG, "pump $label ended", e)
         }
-        if (alive.get()) {
-            fail("连接已断开")
+        if (alive.get() && fatalOnEof) {
+            fail("连接已断开 ($label)")
         }
     }
 
@@ -217,7 +230,8 @@ object SshSessionManager {
                 out.flush()
             } catch (e: Exception) {
                 Log.w(TAG, "write", e)
-                fail("发送失败: ${describeError(e)}")
+                SessionLog.event("write error: ${describeError(e)}")
+                if (!isLive()) fail("发送失败: ${describeError(e)}")
             }
         }
     }
@@ -299,6 +313,7 @@ object SshSessionManager {
     fun disconnect() {
         disconnectInternal()
         _status.value = "已断开"
+        SessionLog.disconnect("user disconnect")
         emitLocal("\r\n\u001b[33mdisconnected\u001b[0m\r\n")
     }
 
@@ -375,6 +390,7 @@ object SshSessionManager {
         if (alive.get()) disconnectInternal()
         _connected.value = false
         _status.value = message
+        SessionLog.disconnect(message)
         emitLocal("\r\n\u001b[31m$message\u001b[0m\r\n")
     }
 
@@ -388,15 +404,16 @@ object SshSessionManager {
     }
 
     private fun emit(chunk: ByteArray) {
-        if (sinks.isEmpty()) {
-            synchronized(backlog) {
-                backlog.addLast(chunk)
-                while (backlog.size > BACKLOG_MAX) backlog.removeFirst()
+        SessionLog.incoming(chunk)
+        synchronized(scrollback) {
+            scrollback.addLast(chunk)
+            scrollbackBytes += chunk.size
+            while (scrollbackBytes > SCROLLBACK_MAX && scrollback.isNotEmpty()) {
+                scrollbackBytes -= scrollback.removeFirst().size
             }
-        } else {
-            sinks.forEach { sink ->
-                try { sink(chunk) } catch (e: Exception) { Log.w(TAG, "sink", e) }
-            }
+        }
+        sinks.forEach { sink ->
+            try { sink(chunk) } catch (e: Exception) { Log.w(TAG, "sink", e) }
         }
     }
 

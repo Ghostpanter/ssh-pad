@@ -1,12 +1,12 @@
-# SSH Pad
+# SSH Pad 1.4.0
 
-面向 Android 平板的 SSH / Telnet 客户端（Jetpack Compose + Material 3）。
+切到其他应用掉线的根因（已修）：
 
-交互参考 [ServerBox](https://github.com/lollipopkit/flutter_server_box)：命令在终端里输入。终端用内置 xterm.js。
+1. 前台服务同时声明了 `dataSync|specialUse`。Android 15+ 对 **dataSync 有超时**，超时后服务不再算前台，进程会被冻结，心跳停、TCP 被 NAT/服务器掐掉。
+2. Activity `onStop` 里 **unbindService**。切走应用就解绑，部分机型会把只靠绑定活着的服务拆掉。
+3. SSH 的 **stderr 读到 EOF 被当成整条连接死了**（PTY 下 stderr 经常是空的）。
+4. 终端 WebView 被系统杀掉后，输出没缓存，回来像「断了」。
 
-- 兼容 Android 8–17（minSdk 26，compile/target 36）
-- 切到其他应用、长时间在后台，**已建立的连接保持**（前台服务 specialUse + CPU/Wi‑Fi 锁 + 8 秒心跳）
-- 规避 `no such algorithm: X25519 for provider BC`
-- 规避 `NetworkOnMainThreadException`
+现改为：只用 `specialUse` 前台服务、切走时重新 ensure FGS、stderr 不再误杀、滚动缓冲回放、8 秒心跳。
 
-首次连接时请：允许通知；电池优化选「允许 / 无限制」。
+「日志」页可保存完整会话和生命周期事件到本地。

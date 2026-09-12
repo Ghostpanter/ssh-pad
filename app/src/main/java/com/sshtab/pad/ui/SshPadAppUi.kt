@@ -20,13 +20,17 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.InsertDriveFile
 import androidx.compose.material.icons.filled.CloudDownload
 import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.LinkOff
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -56,8 +60,10 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.sshtab.pad.log.SessionLog
 import com.sshtab.pad.service.SshSessionService
 import com.sshtab.pad.ssh.HostProfile
 import com.sshtab.pad.ssh.SshSessionManager
@@ -112,11 +118,17 @@ fun SshPadAppUi() {
                             label = { Text("文件") },
                             enabled = kind == TransportKind.SSH,
                         )
+                        NavigationRailItem(
+                            selected = tab == 2,
+                            onClick = { tab = 2 },
+                            icon = { Icon(Icons.Default.Description, null) },
+                            label = { Text("日志") },
+                        )
                     }
-                    if (tab == 0) {
-                        ConnectAndTerminal(Modifier.weight(1f), connected)
-                    } else {
-                        FilePane(Modifier.weight(1f), connected && kind == TransportKind.SSH)
+                    when (tab) {
+                        0 -> ConnectAndTerminal(Modifier.weight(1f), connected)
+                        1 -> FilePane(Modifier.weight(1f), connected && kind == TransportKind.SSH)
+                        else -> LogPane(Modifier.weight(1f))
                     }
                 } else {
                     Column(Modifier.fillMaxSize()) {
@@ -133,9 +145,16 @@ fun SshPadAppUi() {
                                 modifier = Modifier.padding(8.dp),
                                 enabled = kind == TransportKind.SSH,
                             ) { Text("文件") }
+                            FilledTonalButton(
+                                onClick = { tab = 2 },
+                                modifier = Modifier.padding(8.dp),
+                            ) { Text("日志") }
                         }
-                        if (tab == 0) ConnectAndTerminal(Modifier.weight(1f), connected)
-                        else FilePane(Modifier.weight(1f), connected && kind == TransportKind.SSH)
+                        when (tab) {
+                            0 -> ConnectAndTerminal(Modifier.weight(1f), connected)
+                            1 -> FilePane(Modifier.weight(1f), connected && kind == TransportKind.SSH)
+                            else -> LogPane(Modifier.weight(1f))
+                        }
                     }
                 }
             }
@@ -229,9 +248,16 @@ private fun ConnectAndTerminal(modifier: Modifier, connected: Boolean) {
             }
             Spacer(Modifier.height(12.dp))
             Text(
-                "连接后像 ServerBox 一样直接在终端里输入。切到其他应用也会保活：请允许通知，并在弹出的电池优化对话框里选「允许」。",
+                "切到其他应用时请保留通知「后台保活中」。必须允许通知，否则系统会把会话冻死。",
                 style = MaterialTheme.typography.bodySmall,
             )
+            if (SessionLog.lastDisconnectReason.isNotBlank()) {
+                Text(
+                    "上次断开: ${SessionLog.lastDisconnectReason}",
+                    color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
         } else {
             Row(
                 Modifier.fillMaxWidth(),
@@ -430,3 +456,62 @@ private fun FilePane(modifier: Modifier, connected: Boolean) {
         }
     }
 }
+
+@Composable
+private fun LogPane(modifier: Modifier) {
+    val ctx = LocalContext.current
+    val log by SessionLog.text.collectAsState()
+    val scope = rememberCoroutineScope()
+    var message by remember { mutableStateOf("") }
+    val scroll = rememberScrollState()
+    val saveLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri: Uri? ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    ctx.contentResolver.openOutputStream(uri)?.use { out ->
+                        SessionLog.saveTo(out)
+                    }
+                }
+                message = "已保存"
+            } catch (e: Exception) {
+                message = "保存失败: ${e.message}"
+            }
+        }
+    }
+    Column(modifier.padding(16.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            FilledTonalButton(onClick = {
+                val name = "ssh-pad-${System.currentTimeMillis()}.log"
+                saveLauncher.launch(name)
+            }) {
+                Icon(Icons.Default.Save, null)
+                Spacer(Modifier.width(6.dp))
+                Text("保存到本地")
+            }
+            TextButton(onClick = { SessionLog.clear() }) { Text("清空") }
+        }
+        if (message.isNotBlank()) Text(message, color = MaterialTheme.colorScheme.primary)
+        Text(
+            "含终端输出和保活/生命周期事件。切应用后若掉线，把本日志保存发过来即可定位。",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Spacer(Modifier.height(8.dp))
+        Card(Modifier.weight(1f).fillMaxWidth()) {
+            SelectionContainer {
+                Text(
+                    log.ifBlank { "暂无日志" },
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(12.dp)
+                        .verticalScroll(scroll),
+                )
+            }
+        }
+    }
+}
+

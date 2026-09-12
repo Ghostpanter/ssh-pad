@@ -23,6 +23,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import com.sshtab.pad.MainActivity
 import com.sshtab.pad.R
+import com.sshtab.pad.log.SessionLog
 import com.sshtab.pad.ssh.HostProfile
 import com.sshtab.pad.ssh.SshSessionManager
 import com.sshtab.pad.ssh.TransportKind
@@ -56,15 +57,18 @@ class SshSessionService : Service() {
             when (intent?.action) {
                 ACTION_CONNECT -> handleConnect(intent)
                 ACTION_DISCONNECT -> handleDisconnect()
-                null -> {
-                    // START_STICKY 重启：进程还在则只保前台，否则按上次配置重连
-                    if (!SshSessionManager.connected.value) {
-                        loadSavedProfile()?.let { reconnect(it) }
+                ACTION_ENSURE -> {
+                    SessionLog.event("FGS ensure, connected=${SshSessionManager.connected.value} live=${SshSessionManager.isLive()}")
+                    if (SshSessionManager.connected.value || SshSessionManager.isLive()) {
+                        startKeepAliveLoop()
                     }
                 }
-                else -> {
-                    if (!SshSessionManager.connected.value) {
+                null -> {
+                    SessionLog.event("FGS sticky restart")
+                    if (!SshSessionManager.isLive()) {
                         loadSavedProfile()?.let { reconnect(it) }
+                    } else {
+                        startKeepAliveLoop()
                     }
                 }
             }
@@ -76,27 +80,40 @@ class SshSessionService : Service() {
     }
 
     override fun onTimeout(startId: Int) {
-        Log.w(TAG, "FGS onTimeout startId=$startId, re-promote specialUse")
+        SessionLog.event("FGS onTimeout startId=$startId — re-promote specialUse, NOT stopping")
         startInForegroundSafely()
     }
 
     override fun onTimeout(startId: Int, fgsType: Int) {
-        Log.w(TAG, "FGS onTimeout startId=$startId type=$fgsType")
+        SessionLog.event("FGS onTimeout startId=$startId type=$fgsType — re-promote specialUse, NOT stopping")
         startInForegroundSafely()
     }
 
     override fun onTaskRemoved(rootIntent: Intent?) {
-        Log.i(TAG, "task removed, keeping session")
+        SessionLog.event("task removed, keeping session")
         startInForegroundSafely()
         acquireLocks()
         if (SshSessionManager.connected.value) startKeepAliveLoop()
     }
 
     override fun onDestroy() {
+        SessionLog.event("service onDestroy connected=${SshSessionManager.connected.value} live=${SshSessionManager.isLive()}")
+        val live = SshSessionManager.connected.value || SshSessionManager.isLive()
         stopKeepAliveLoop()
         releaseLocks()
         releaseNetwork()
         super.onDestroy()
+        if (live) {
+            try {
+                ContextCompat.startForegroundService(
+                    applicationContext,
+                    Intent(applicationContext, SshSessionService::class.java).setAction(ACTION_ENSURE),
+                )
+                SessionLog.event("requested FGS restart after onDestroy")
+            } catch (t: Throwable) {
+                SessionLog.event("FGS restart failed: ${t.javaClass.simpleName}: ${t.message}")
+            }
+        }
     }
 
     private fun handleConnect(intent: Intent) {
@@ -165,14 +182,17 @@ class SshSessionService : Service() {
                 try {
                     if (SshSessionManager.connected.value) {
                         val ok = SshSessionManager.keepAliveOnce()
-                        if (!ok) {
-                            Log.w(TAG, "keepalive reported dead")
+                        if (ticks % 8 == 0) {
+                            SessionLog.event("keepalive tick live=$ok")
+                            updateNotification()
                         }
-                        if (ticks % 2 == 0) updateNotification()
+                        if (!ok && !SshSessionManager.isLive()) {
+                            SshSessionManager.fail("连接已断开 (keepalive)")
+                        }
                     }
                 } catch (t: Throwable) {
-                    Log.w(TAG, "keepalive", t)
-                    if (SshSessionManager.connected.value) {
+                    SessionLog.event("keepalive error: ${t.javaClass.simpleName}: ${t.message}")
+                    if (!SshSessionManager.isLive()) {
                         SshSessionManager.fail("连接已断开: ${t.javaClass.simpleName}")
                     }
                 }
@@ -263,24 +283,20 @@ class SshSessionService : Service() {
         val errors = mutableListOf<String>()
         if (Build.VERSION.SDK_INT >= 34) {
             val special = ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-            val dataSync = ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            try {
-                startForeground(NOTIF_ID, notification, special or dataSync)
-                return
-            } catch (t: Throwable) {
-                errors += "combo:${t.javaClass.simpleName}"
-            }
             try {
                 startForeground(NOTIF_ID, notification, special)
+                SessionLog.event("startForeground specialUse ok")
                 return
             } catch (t: Throwable) {
-                errors += "special:${t.javaClass.simpleName}"
+                errors += "special:${t.javaClass.simpleName}:${t.message}"
             }
             try {
-                startForeground(NOTIF_ID, notification, dataSync)
+                @Suppress("DEPRECATION")
+                startForeground(NOTIF_ID, notification)
+                SessionLog.event("startForeground no-type fallback ok")
                 return
             } catch (t: Throwable) {
-                errors += "data:${t.javaClass.simpleName}"
+                errors += "plain:${t.javaClass.simpleName}"
             }
         } else if (Build.VERSION.SDK_INT >= 29) {
             try {
@@ -301,6 +317,7 @@ class SshSessionService : Service() {
             return
         }
         Log.w(TAG, "foreground not started: $errors")
+        SessionLog.event("startForeground FAILED $errors")
     }
 
     private fun updateNotification() {
@@ -387,6 +404,7 @@ class SshSessionService : Service() {
         private const val TAG = "SshSessionService"
         const val ACTION_CONNECT = "com.sshtab.pad.CONNECT"
         const val ACTION_DISCONNECT = "com.sshtab.pad.DISCONNECT"
+        const val ACTION_ENSURE = "com.sshtab.pad.ENSURE"
         const val EXTRA_NAME = "name"
         const val EXTRA_HOST = "host"
         const val EXTRA_PORT = "port"
@@ -435,6 +453,21 @@ class SshSessionService : Service() {
                 }
             }
             requestUnrestrictedBackground(context)
+        }
+
+        fun ensureRunning(context: Context) {
+            if (!SshSessionManager.connected.value && !SshSessionManager.isLive()) return
+            val intent = Intent(context, SshSessionService::class.java).setAction(ACTION_ENSURE)
+            try {
+                ContextCompat.startForegroundService(context, intent)
+            } catch (t: Throwable) {
+                SessionLog.event("ensureRunning FGS failed: ${t.message}")
+                try {
+                    context.startService(intent)
+                } catch (t2: Throwable) {
+                    SessionLog.event("ensureRunning startService failed: ${t2.message}")
+                }
+            }
         }
 
         fun requestUnrestrictedBackground(context: Context) {
